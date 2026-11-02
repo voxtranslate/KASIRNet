@@ -1,0 +1,13 @@
+# Colab G4 runtime already provides torch / torchvision / numpy / scipy / scikit-learn / matplotlib / tqdm / pillow
+torch>=2.3
+torchvision>=0.18
+pyiqa==0.1.16        # the metric implementation that produced the reported figures (installed with --no-deps in the notebook)
+lmdb                 # SIDD validation crops
+gdown                # Snow100K and DPDD official archives
+kagglehub            # all other datasets
+scipy
+scikit-learn
+matplotlib
+tqdm
+pillow
+numpy
