@@ -199,6 +199,9 @@ class Trainer:
         if not os.path.exists(path):
             return
         ck = torch.load(path, map_location=self.device, weights_only=False)
+        if ck.get('total_iters') != self.total_iters:
+            print(f'[{self.run_id}] !! the budget changed since the checkpoint ({ck.get("total_iters")} -> {self.total_iters} '
+                  f'iterations, e.g. EPOCHS or the training pool changed); the cosine schedule follows the new budget')
         self.model.load_state_dict(ck['model_state_dict'])
         self.optimizer.load_state_dict(ck['optimizer_state_dict'])
         self.scheduler.load_state_dict(ck['scheduler_state_dict'])

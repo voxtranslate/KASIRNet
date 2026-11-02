@@ -166,6 +166,9 @@ SUBMITTED_CODE_FACTS = {   # read from the submitted notebook/config (commit 1d4
                    'kohler_blur = the same folders; the notebook test entry is empty',
     'data_snow_sidd': 'DATA_CONFIG snow has empty paths (no snow training data); no SIDD path in any configuration; the snow '
                       'test folder came from a private gdown archive (/content/input, /content/gt)',
+    'data_hide': 'DATA_CONFIG hide = DBlur/HIDE/train, a folder that does not exist in the DBlur collection (HIDE is test-only '
+                 'there, 2025 pairs); the loader silently skipped empty folders, so no HIDE image was trained on and the '
+                 'submitted pool had 12 non-empty categories (hide and snow empty)',
     'srb_gate': 'resonance_gate ends with Sigmoid and is not zero-initialised (G ~ 0.5 at initialisation, see check below)',
 }
 

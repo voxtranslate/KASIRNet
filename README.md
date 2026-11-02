@@ -30,37 +30,37 @@ KASIRNet is a four-scale U-Net trained once on a pool of degradation categories 
 | item | value |
 |---|---|
 | hardware | 1 × NVIDIA RTX PRO 6000 Blackwell Server Edition 96 GB (Colab G4 runtime); exact device/driver/CUDA/cuDNN/PyTorch versions are recorded in each `run.json` |
-| patches | 256 × 256 random crops, random horizontal and vertical flips (images smaller than 256 are first resized up) |
+| patches | 256 × 256 random crops, random horizontal and vertical flips; images whose shorter side is below 256 (CelebA, 178 × 218) are first up-scaled with bicubic interpolation keeping the aspect ratio |
 | batch / optimiser | 6 / Adam (β = 0.9, 0.999), learning rate 1e-4, no weight decay |
 | schedule | cosine annealing per iteration from 1e-4 to 1e-7 over the whole budget, gradient-norm clipping 1.0 |
 | precision | FP16 autocast + GradScaler (the FFT path of the SRB is computed in FP32) |
 | loss | `5.0 L_pix + 0.5 L_fft + 1.0 L_perc + 1.0 L_ssim + 1.0 L_id + 0.5 L_edge` (definitions in `Loss.py`) |
-| budget | full model: 100 epochs, one epoch = ⌊N_train / 6⌋ iterations (≈ 0.4 M iterations); every ablation run: 10 epochs (identical reduced budget for all 46 runs). Iterations and wall-clock time are written to `run.json` and `tables/section41_runs.csv` |
+| budget | full model: 100 epochs, one epoch = ⌊N_train / 6⌋ iterations (≈ 3,400 iterations per epoch, ≈ 0.34 M iterations); every ablation run: 10 epochs (identical reduced budget for all 46 runs). Iterations and wall-clock time are written to `run.json` and `tables/section41_runs.csv` |
 | stopping / selection | fixed budget, no early stopping; the reported checkpoint is the one with the best mean PSNR on a validation split held out from the training pool (10 pairs per category, centre 256 × 256 crops, never a test image) |
 | seeds | full model seed 1; ablations seeds 1, 2, 3 (TODO-12A) or 1; data subsets seeded (`DATA_SUBSET_SEED` = 2026), synthetic test degradations seeded per image |
 | frozen networks | VGG-19 and ResNet-50 / ConvNeXt-T with torchvision `IMAGENET1K_V1` weights, always in eval mode; the loss networks (VGG-19 perceptual, ResNet-50 identity) exist only during training |
 
-### Training pool (14 categories, written to `data_manifest/train_manifest.json`)
+### Training pool (13 categories, written to `data_manifest/train_manifest.json`)
 
 | family | categories (source) |
 |---|---|
-| blur | GoPro, HIDE, TextOCR, CelebA, Helen training splits (DBlur collection) |
+| blur | GoPro, TextOCR, CelebA, Helen training splits (DBlur collection; the collection has no HIDE training split, so HIDE is evaluated with the standard GoPro → HIDE protocol) |
 | rain | RainTrainH (heavy) and RainTrainL-1800 (light) from JRDR, **direction rainy → clean, pairs matched by image id, backgrounds duplicated in Rain100H/Rain100L test removed**; DeRaindrop training split (raindrops) |
 | haze | RESIDE-6K training split |
 | snow | Snow100K training set |
 | noise | SIDD-Medium sRGB (320 pairs, 8 random crops of each per epoch), salt-and-pepper, noisy documents, AlphaISP 2DNR |
 
-Each category is capped at 2,500 pairs (seeded random subset). Köhler has no training split and is a test set only (`KOHLER_PROTOCOL = 'test_only'`; `'scene_split'` trains on scenes 1–3 and tests on scene 4).
+Each category is capped at 2,500 pairs (seeded random subset). Before the cap, every training candidate is compared with the clean images of every benchmark of the same degradation family and near-duplicates are removed (`Datasets.LeakageAuditor`). A sample of every category and benchmark is then checked for readability, size agreement, alignment and direction of the degradation (`data_manifest/data_validation.json`); a category that looks mis-paired or swapped stops the run. Köhler has no training split and is a test set only (`KOHLER_PROTOCOL = 'test_only'`; `'scene_split'` trains on scenes 1–3 and tests on scene 4).
 
 ### Evaluation protocol (TODO-01)
 
 * Metric function (`metrics.py`, pyiqa 0.1.16 defaults): **PSNR** on RGB, data range 1, no border crop; **SSIM** on the Y channel of YIQ scaled to [0, 255] and rounded, Gaussian window 11 × 11 (σ = 1.5), valid filtering, no down-sampling, no border crop; **LPIPS** AlexNet v0.1; **DISTS**.
 * Full-resolution inputs, batch 1, FP32 forward pass, output clamped to [0, 1] and not quantised; every image of every test set; mean of per-image values. A ground truth whose size differs from the input is resized to the input size (counted in `summary.json`).
-* Test sets: GoPro (1,111), HIDE (2,025), TextOCR (DBlur test), Köhler (48), Rain100L (100, 481 × 321), Rain100H (100), RESIDE-6K (1,000), Snow100K-S/M/L (official test sets), SIDD validation (1,280 crops of 256 × 256); severity and zero-shot sets: CBSD68 + Gaussian σ = 15/25/50, LIVE1 JPEG q = 10 (29), LOL eval (15), DPDD test (76, combined image); mixed sets: GoPro + Gaussian 25, Rain100L + haze (β = 1.0, A = 0.8), Snow100K-L + Gaussian 25.
+* Test sets: GoPro (1,111), HIDE (2,025), TextOCR (500, DBlur test split), Köhler (48), Rain100L (100, 481 × 321), Rain100H (100), RESIDE-6K (1,000), Snow100K-S/M/L (16,611 / 16,588 / 16,801, official test sets), SIDD validation (1,280 crops of 256 × 256); severity and zero-shot sets: CBSD68 + Gaussian σ = 15/25/50, LIVE1 JPEG q = 10 (29), LOL eval (15), DPDD test (76, combined image); mixed sets: GoPro + Gaussian 25, Rain100L + haze (β = 1.0, A = 0.8), Snow100K-L + Gaussian 25.
 
 ## Running
 
-Open `KASIRNet.ipynb` in Colab with the G4 runtime and *Run all*. Datasets are downloaded with `kagglehub` and the official Google-Drive archives (Snow100K, DPDD test); outputs go to `Config.OUTPUT_ROOT` on Google Drive. Stages are idempotent and every run checkpoints every 2,000 iterations, so a session that ends is resumed by running the notebook again (resumption is bit-exact). Several G4 sessions can run the notebook at the same time on the same Drive folder: a run in training is locked, so the sessions split the ablation queue. Competitor outputs held by the authors are read from `Config.COMPETITOR_ROOT/<benchmark>/<method>/` (files named like the test inputs).
+Open `KASIRNet.ipynb` in Colab with the G4 runtime and *Run all*. Datasets are downloaded once (`kagglehub`, the official Snow100K Google-Drive archives, the DPDD test split from the Hugging Face mirror `JacobLinCool/DPDD`) and packed into one tar per source in `Config.DATA_CACHE_ROOT` on Google Drive; later sessions restore these tars to the local disk instead of downloading (`DATA_CACHE_MODE = 'used'` keeps only the files the experiments read, `'full'` the complete sources). If a Google-Drive download fails with “quota exceeded”, put a copy of the archive in `DATA_CACHE_ROOT/archives/`. Outputs go to `Config.OUTPUT_ROOT` on Google Drive. Stages are idempotent and every run checkpoints every 2,000 iterations, so a session that ends is resumed by running the notebook again (resumption is bit-exact). Several G4 sessions can run the notebook at the same time on the same Drive folder: a run in training is locked, so the sessions split the ablation queue. Competitor outputs held by the authors are read from `Config.COMPETITOR_ROOT/<benchmark>/<method>/` (files named like the test inputs).
 
 Outputs used by the manuscript (all under `OUTPUT_ROOT/tables`, CSV + LaTeX rows, PSNR with two decimals, SSIM with three):
 

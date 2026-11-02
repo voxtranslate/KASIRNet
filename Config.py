@@ -38,7 +38,18 @@ class Config:
     # ------------------------------------------------------------------- paths
     DRIVE_MOUNT = '/content/drive'
     OUTPUT_ROOT = '/content/drive/MyDrive/KASIRNet_revision'   # checkpoints, results, tables (persistent)
-    DATA_ROOT = '/content/datasets'                            # gdown archives are extracted here (local disk)
+    DATA_ROOT = '/content/datasets'                            # local disk: downloads and restored caches
+    # ---- dataset cache on Google Drive.  First session: every source is downloaded (kagglehub,
+    # Hugging Face, Google Drive) and then packed into ONE uncompressed tar per source in
+    # DATA_CACHE_ROOT; later sessions extract these tars to local disk instead of downloading.
+    #   'used' : only the files the experiments read (frozen training manifest + every benchmark);
+    #            if the training manifest has to be rebuilt the full source is downloaded again
+    #   'full' : the complete sources (about 55 GB of Drive space)   |   'off': no cache
+    DATA_CACHE_ROOT = '/content/drive/MyDrive/KASIRNet_revision/datasets_cache'
+    DATA_CACHE_MODE = 'used'
+    DATA_CACHE_REFRESH = False    # True: rebuild the tars of this session's sources
+    # Google-Drive archives often fail with "quota exceeded".  A copy of the archive placed by hand in
+    # DATA_CACHE_ROOT/archives/<file name> (Drive web page -> "Make a copy" / "Add shortcut") is used first.
     LEGACY_CHECKPOINT = '/content/drive/MyDrive/Checkpoints/KASIRNet/best.pth'        # submitted model (audit only)
     LEGACY_NOSIM_CHECKPOINT = ''                                                       # submitted "w/o SIM" model, if kept
     # Competitor outputs held by the authors (restored images named like the test inputs).
@@ -60,7 +71,7 @@ class Config:
     # --------------------------------------------------------- data sources
     # kagglehub.dataset_download(slug) returns the local root of each source.
     KAGGLE_SOURCES = {
-        'dblur':    'jishnuparayilshibu/a-curated-list-of-image-deblurring-datasets',  # GoPro/HIDE/TextOCR/CelebA/Helen
+        'dblur':    'jishnuparayilshibu/a-curated-list-of-image-deblurring-datasets',  # GoPro train/test, HIDE test only, TextOCR, CelebA, Helen
         'kohler':   'eshapahwa1302/kohlerdeblur',              # 4 scenes x 12 kernels = 48 pairs
         'jrdr':     'shivakanthsujit/jrdr-deraining-dataset',  # RainTrainH / RainTrainL (1800 each)
         'raindrop': 'chenchienying/deraindataset',             # DeRaindrop: train 861 / test_a 58 / test_b 249
@@ -76,12 +87,19 @@ class Config:
         'live1':    'nikshko/live-1',                          # LIVE1 references (29 bmp)
         'legacy_raining': 'adeshpal/image-deraining',          # audit only: the "raining" category of the submitted pool
     }
-    # Google-Drive archives (official links of the dataset authors)
+    # Google-Drive archives (official links of the dataset authors).  Layouts checked on the archives:
+    # training tar -> all/{gt,mask,synthetic}; test tar -> media/jdway/GameSSD/overlapping/test/Snow100K-{S,M,L}/{gt,mask,synthetic}
     GDOWN_SOURCES = {
         'snow100k_train': dict(id='1SGS2w2RBhfwAMn9dMQZUnoQcqCcz1baU', file='Snow100K-training.tar.gz'),
         'snow100k_test':  dict(id='15z-A3i3Z2ybdKuyxwYRA8YKxIA8_kTDm', file='Snow100K-testset.tar.gz'),
-        'dpdd_test':      dict(id='1dDWUQ_D93XGtcywoUcZE1HOXCV4EuLyw', file='dpdd_test.zip'),
     }
+    # Hugging Face parquet mirrors.  DPDD test (76 pairs, 1680x1120, original file names, combined image
+    # 'source' = inputC, 'target'); the official Google-Drive file (DPDD_GDOWN_ID) is the fallback.
+    HF_PARQUET_SOURCES = {
+        'dpdd_test': dict(repo='JacobLinCool/DPDD', files=[f'combined/test-0000{i}-of-00003.parquet' for i in range(3)],
+                          columns={'source': 'test/inputC', 'target': 'test/target'}, key_column='source'),
+    }
+    DPDD_GDOWN_ID = '1dDWUQ_D93XGtcywoUcZE1HOXCV4EuLyw'
 
     # -------------------------------------------------------- training pool
     # family is used by the prompt probe and by the per-family reports.
@@ -90,8 +108,8 @@ class Config:
     # image of these benchmarks are removed (leakage audit, see Datasets.LeakageAuditor).
     _JRDR_MATCH = ('regex', r'norain-(\d+)x2', r'norain-(\d+)')
     TRAIN_CATEGORIES = {
+        # (DBlur has no HIDE training split: HIDE is a test set only, the standard GoPro -> HIDE protocol)
         'gopro':      dict(family='blur',  input=('dblur', 'DBlur/Gopro/train/blur'),   gt=('dblur', 'DBlur/Gopro/train/sharp')),
-        'hide':       dict(family='blur',  input=('dblur', 'DBlur/HIDE/train/blur'),    gt=('dblur', 'DBlur/HIDE/train/sharp')),
         'textocr':    dict(family='blur',  input=('dblur', 'DBlur/TextOCR/train/blur'), gt=('dblur', 'DBlur/TextOCR/train/sharp')),
         'celeba':     dict(family='blur',  input=('dblur', 'DBlur/CelebA/train/blur'),  gt=('dblur', 'DBlur/CelebA/train/sharp')),
         'helen':      dict(family='blur',  input=('dblur', 'DBlur/Helen/train/blur'),   gt=('dblur', 'DBlur/Helen/train/sharp')),
@@ -100,8 +118,9 @@ class Config:
                            match=_JRDR_MATCH, exclude_overlap_with=['rain100h', 'rain100l']),
         'rain_light': dict(family='rain',  input=('jrdr', 'JRDR/rain_data_train_Light/rain'), gt=('jrdr', 'JRDR/rain_data_train_Light/norain'),
                            match=_JRDR_MATCH, exclude_overlap_with=['rain100l', 'rain100h']),
+        # raindrops on the glass blur and veil the scene: the clean image has the higher contrast
         'raindrop':   dict(family='rain',  input=('raindrop', 'train/data'), gt=('raindrop', 'train/gt'),
-                           match=('regex', r'(\d+)_rain', r'(\d+)_clean')),
+                           match=('regex', r'(\d+)_rain', r'(\d+)_clean'), direction='contrast_gt'),
         'haze':       dict(family='haze',  input=('reside6k', 'RESIDE-6K/train/hazy'), gt=('reside6k', 'RESIDE-6K/train/GT'),
                            exclude_overlap_with=['reside6k']),
         'snow':       dict(family='snow',  input=('snow100k_train', '**/synthetic'), gt=('snow100k_train', '**/gt')),
@@ -109,7 +128,8 @@ class Config:
                            repeat=8),   # 320 very large images: 8 random crops of each per epoch
         'sp_noise':   dict(family='noise', input=('sp_noise', 'Noisy_folder'), gt=('sp_noise', 'Ground_truth'),
                            match=('regex', r'noisy_(.+)', r'(.+)')),
-        'docs':       dict(family='noise', input=('docs', 'train'), gt=('docs', 'train_cleaned')),
+        # stained documents: the cleaned page (black text on white) has the higher contrast
+        'docs':       dict(family='noise', input=('docs', 'train'), gt=('docs', 'train_cleaned'), direction='contrast_gt'),
         'alphaisp':   dict(family='noise', input=('alphaisp', 'AlphaISP - Denoising Dataset/AlphaISP - Denoising Dataset/PNG Data/2DNR Denoising/Noised'),
                            gt=('alphaisp', 'AlphaISP - Denoising Dataset/AlphaISP - Denoising Dataset/PNG Data/2DNR Denoising/Ground Truth')),
     }
@@ -120,8 +140,22 @@ class Config:
     MAX_PER_CATEGORY = 2500       # seeded random subset when a category is larger
     VAL_PER_CATEGORY = 10         # held out from training, used only to select the checkpoint
     DATA_SUBSET_SEED = 2026
+    # Leakage audit: every training candidate is compared with the clean images of every benchmark of
+    # the same degradation family (and of `exclude_overlap_with`); near-duplicates are removed before
+    # the per-category cap is applied.  Screening: correlation of 24x24 grey thumbnails > OVERLAP_THRESHOLD,
+    # confirmation: 64x64 thumbnails > OVERLAP_CONFIRM and aspect ratio within 5 %.
     EXCLUDE_TEST_OVERLAP = True
-    OVERLAP_THRESHOLD = 0.97      # correlation of 24x24 grey thumbnails (finds the 546 known RainTrainH/Rain100H duplicates)
+    OVERLAP_THRESHOLD = 0.97
+    OVERLAP_CONFIRM = 0.95
+    # Pair validation (audit stage): per category / benchmark, VALIDATE_SAMPLES pairs are checked for
+    # readability, size agreement, alignment (64x64 grey correlation >= MIN_PAIR_CORR) and degradation
+    # direction (input blurrier / noisier / hazier than the ground truth).  A category whose median
+    # correlation or direction rate is below the limits stops the run (MISPAIR / SWAP).
+    VALIDATE_SAMPLES = 40
+    MIN_PAIR_CORR = 0.5
+    MIN_DIRECTION_RATE = 0.6
+    VALIDATION_STRICT = True          # stop before training if a training category is flagged
+    ALLOW_MISSING_CATEGORIES = False  # a training category without data is an error (not silently skipped)
 
     # ------------------------------------------------------------- benchmarks
     _KOHLER_MATCH = ('regex', r'Blurry(\d+_\d+)', r'Sharp(\d+_\d+)')
@@ -146,7 +180,7 @@ class Config:
         # ---- TODO-17 zero-shot (degradations never trained on)
         'live1_q10':  dict(family='jpeg',     clean=('live1', 'live1'), degrade=[('jpeg', 10)]),
         'lol':        dict(family='lowlight', input=('lol', 'lol_dataset/eval15/low'), gt=('lol', 'lol_dataset/eval15/high')),
-        'dpdd':       dict(family='defocus',  input=('dpdd_test', '**/inputC'), gt=('dpdd_test', '**/target')),
+        'dpdd':       dict(family='defocus',  input=('dpdd_test', 'test/inputC'), gt=('dpdd_test', 'test/target')),
         # ---- TODO-16 mixed degradations (second degradation added to the first one)
         'mix_gopro_g25':      dict(family='mixed', base='gopro', degrade=[('gaussian', 25)], families=('blur', 'noise')),
         'mix_rain100l_haze':  dict(family='mixed', base='rain100l', degrade=[('haze', 1.0, 0.8)], families=('rain', 'haze')),
@@ -168,8 +202,8 @@ class Config:
     ETA_MIN = 1e-7                # cosine annealing per iteration from LR to ETA_MIN over the whole budget
     GRAD_CLIP = 1.0
     # Budget.  One epoch = one pass over the (capped, repeated) training pool, i.e.
-    # floor(N_train / BATCH_SIZE) iterations (about 4.0-4.5k iterations for this pool).
-    # The full model gets 100 epochs (~0.4 M iterations, ~2.4 M patches).  Every ablation run gets
+    # floor(N_train / BATCH_SIZE) iterations (about 20,400 samples -> 3,400 iterations for this pool).
+    # The full model gets 100 epochs (~0.34 M iterations, ~2.0 M patches).  Every ablation run gets
     # the identical reduced budget B = 10 epochs (one tenth): 46 runs x B = 4.6 full-run equivalents.
     # main() prints the measured s/iteration and the GPU-hours left for the whole plan; raise
     # ABLATION_EPOCHS if the deadline allows (all ablation runs must share the same value).

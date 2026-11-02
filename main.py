@@ -10,7 +10,8 @@ import numpy as np
 import torch
 
 from Config import Config  # nb:skip
-from Datasets import resolve_sources, spec_sources, build_training_manifest, BenchmarkDataset  # nb:skip
+from Datasets import (resolve_sources, spec_sources, build_training_manifest, BenchmarkDataset, DatasetCache,  # nb:skip
+                      manifest_is_current, overlap_benchmarks, manifest_used_files, validate_data, resolve_path)  # nb:skip
 from Trainer import Trainer, read_json, write_json, try_lock, release_lock  # nb:skip
 from Inferencer import Evaluator, KASIRNetInferencer  # nb:skip
 from Analysis import (step0_audit, cost_report, significance_report, prompt_probe_report, severity_report,  # nb:skip
@@ -34,15 +35,23 @@ class Experiment:
     def __init__(self, cfg):
         self.cfg = cfg
         self.device = torch.device(cfg.DEVICE if torch.cuda.is_available() else 'cpu')
-        self._roots, self._manifest, self._evaluator = {}, None, None
+        self._roots, self._origin, self._manifest, self._evaluator = {}, {}, None, None
+        self.cache = DatasetCache(cfg)
         self.stop = False
 
     # ------------------------------------------------------------ helpers
-    def roots(self, keys):
-        missing = [k for k in set(keys) if k not in self._roots]
-        for k in missing:
+    def roots(self, keys, need_full=False):
+        """Local roots of the data sources: Drive cache first, original download otherwise.
+        need_full: a source restored from a 'used' cache is replaced by the complete source."""
+        for k in sorted(set(keys)):
+            partial = k in self._roots and self._origin.get(k) == 'used'
+            if k in self._roots and not (need_full and partial):
+                continue
             try:
-                self._roots.update(resolve_sources(self.cfg, [k]))
+                self._roots.update(resolve_sources(self.cfg, [k], self.cache, need_full))
+                m = self.cache.info(k)
+                from_cache = self._roots[k].startswith(self.cache.local)
+                self._origin[k] = (m['mode'] if (m and from_cache) else 'origin')
             except Exception as e:
                 print(f'[data] source {k} unavailable: {e}')
         return self._roots
@@ -52,13 +61,31 @@ class Experiment:
         return self.roots([k for n in benches for k in spec_sources(b[n], b)])
 
     def manifest(self):
+        """Frozen training manifest (built once from the complete sources, then reused)."""
         if self._manifest is None:
             cats = self.cfg.train_categories()
             b = self.cfg.benchmarks()
             keys = [k for s in cats.values() for k in spec_sources(s)]
             keys += [k for s in cats.values() for n in s.get('exclude_overlap_with', []) for k in spec_sources(b[n], b)]
-            self._manifest = build_training_manifest(self.cfg, self.roots(keys))
+            keys += [k for names in overlap_benchmarks(self.cfg).values() for n in names for k in spec_sources(b[n], b)]
+            current = manifest_is_current(self.cfg)
+            self._manifest = build_training_manifest(self.cfg, self.roots(keys, need_full=not current))
         return self._manifest
+
+    def cache_sources(self):
+        """Pack every source downloaded in this session into the Drive cache."""
+        if self.cfg.DATA_CACHE_MODE == 'off':
+            return
+        used = manifest_used_files(self.cfg, self._roots, self.manifest())
+        try:   # the Step-0 audit reads the complete RainTrainH folders
+            d = resolve_path(self._roots, ('jrdr', 'JRDR/rain_data_train_Heavy'))
+            for dp, _, fs in os.walk(d):
+                used.setdefault('jrdr', set()).update(os.path.relpath(os.path.join(dp, f), self._roots['jrdr']) for f in fs)
+        except (FileNotFoundError, KeyError):
+            pass
+        for k, root in sorted(self._roots.items()):
+            if self._origin.get(k) == 'origin':
+                self.cache.store(k, root, None if k == 'legacy_raining' else used.get(k))
 
     def evaluator(self):
         if self._evaluator is None:
@@ -96,10 +123,17 @@ class Experiment:
 
     # ------------------------------------------------------------- stages
     def stage_audit(self):
-        """Step 0: facts from code/checkpoints/data + frozen training manifest (with leakage audit)."""
-        self.manifest()
-        roots = self.roots(['jrdr', 'rain100l', 'legacy_raining'])
-        step0_audit(self.cfg, roots, self.device)
+        """Step 0: all sources (Drive cache or download), frozen training manifest with the leakage
+        audit, validation of every training category and benchmark, Step-0 facts, Drive cache."""
+        cfg = self.cfg
+        man = self.manifest()
+        b = cfg.benchmarks()
+        self.roots([k for n in b for k in spec_sources(b[n], b)] + ['jrdr', 'rain100l', 'legacy_raining'])
+        if not os.path.exists(os.path.join(cfg.manifest_dir, 'data_validation.json')):
+            validate_data(cfg, self._roots, man)
+        if not os.path.exists(os.path.join(cfg.analysis_dir('step0_facts'), 'facts.json')):
+            step0_audit(cfg, self._roots, self.device)
+        self.cache_sources()
 
     def train(self, run):
         """Train one run unless another live session holds it.  Returns its status."""

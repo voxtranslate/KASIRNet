@@ -21,7 +21,7 @@ Each code cell below is **identical** to the module of the same name in the repo
 
 | stage | what it does | main outputs (under `OUTPUT_ROOT`) |
 |---|---|---|
-| `audit` | downloads the data, builds the frozen training manifest with the train/test leakage audit, writes the Step-0 facts (metric definition, SSIM-loss gradient, SRB gate initialisation, submitted checkpoint, data pairing) | `data_manifest/train_manifest.json`, `analysis/step0_facts/` |
+| `audit` | restores the datasets from the Google-Drive cache (or downloads them once and caches them), builds the frozen training manifest with the train/test leakage audit, validates every category and benchmark (pairing, alignment, direction, sizes), writes the Step-0 facts (metric definition, SSIM-loss gradient, SRB gate initialisation, submitted checkpoint, data pairing) | `datasets_cache/*.tar`, `data_manifest/{train_manifest,data_validation}.json`, `analysis/step0_facts/` |
 | `train_full` | full KASIRNet, paper hyper-parameters (batch 6, Adam 1e-4, cosine, clip 1.0, FP16, six loss weights 5/0.5/1/1/1/0.5), `EPOCHS` = 100 | `checkpoints/KASIRNet_full/final.pth`, `runs/KASIRNet_full/{run.json, curves.png, history_*.csv}` |
 | `eval_full` | 8 benchmarks + Rain100H + Snow100K-S/M + Gaussian σ15/25/50 + LIVE1/LOL/DPDD at full resolution | `runs/KASIRNet_full/eval/<bench>/per_image.csv` (PSNR, SSIM, LPIPS, DISTS), `summary.json` |
 | `analyses_full` | cost (TODO-13), bootstrap CI + Wilcoxon (TODO-12C), LPIPS/DISTS + divergent % (TODO-14), prompt probe + mixed sets (TODO-16), spectral/phase analysis, feature stability, Figs. S1/S2 (TODO-06), explainability | `tables/`, `analysis/` |
