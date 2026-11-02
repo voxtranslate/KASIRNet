@@ -266,7 +266,9 @@ def build_training_manifest(cfg, roots, force=False):
         man['train'] += [dict(input=a, gt=b, category=name, family=spec['family'], repeat=spec.get('repeat', 1)) for a, b, _ in train]
         man['val'] += [dict(input=a, gt=b, category=name, family=spec['family']) for a, b, _ in val]
         print(f'[data] {name:11s} pairs={rep["n_pairs"]:6d}  overlap-removed={len(removed):5d}  train={len(train):5d}  val={len(val):3d}  repeat={spec.get("repeat", 1)}')
-    json.dump(man, open(path, 'w'), indent=1)
+    with open(path + '.tmp', 'w') as f:   # atomic: several sessions may build it at the same time
+        json.dump(man, f, indent=1)
+    os.replace(path + '.tmp', path)
     return man
 
 

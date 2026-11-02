@@ -30,6 +30,10 @@ class Config:
     CUDNN_BENCHMARK = True
     DETERMINISTIC = False         # True -> cudnn.deterministic (slower); seeds are always fixed
     MAX_SESSION_HOURS = 23.5      # save + stop cleanly before a Colab session is recycled
+    # Several Colab sessions (each with its own G4) can run main() at the same time on the same
+    # Drive folder: a run being trained is locked (heartbeat at every checkpoint) and skipped by the
+    # other sessions; a lock older than LOCK_STALE_MINUTES is considered abandoned.
+    LOCK_STALE_MINUTES = 45
 
     # ------------------------------------------------------------------- paths
     DRIVE_MOUNT = '/content/drive'
@@ -165,10 +169,12 @@ class Config:
     GRAD_CLIP = 1.0
     # Budget.  One epoch = one pass over the (capped, repeated) training pool, i.e.
     # floor(N_train / BATCH_SIZE) iterations (about 4.0-4.5k iterations for this pool).
-    # The full model gets 100 epochs (~0.4 M iterations, ~2.5 M patches, about 1-1.5 day on G4);
-    # every ablation run gets the identical reduced budget B = 20 epochs (one fifth).
+    # The full model gets 100 epochs (~0.4 M iterations, ~2.4 M patches).  Every ablation run gets
+    # the identical reduced budget B = 10 epochs (one tenth): 46 runs x B = 4.6 full-run equivalents.
+    # main() prints the measured s/iteration and the GPU-hours left for the whole plan; raise
+    # ABLATION_EPOCHS if the deadline allows (all ablation runs must share the same value).
     EPOCHS = 100
-    ABLATION_EPOCHS = 20
+    ABLATION_EPOCHS = 10
     CKPT_EVERY_ITERS = 2000       # resumable checkpoint (atomic write) every N iterations
     VAL_EVERY_ITERS = 5000
     LOG_EVERY_ITERS = 100

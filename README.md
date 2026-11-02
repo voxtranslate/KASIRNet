@@ -35,7 +35,7 @@ KASIRNet is a four-scale U-Net trained once on a pool of degradation categories 
 | schedule | cosine annealing per iteration from 1e-4 to 1e-7 over the whole budget, gradient-norm clipping 1.0 |
 | precision | FP16 autocast + GradScaler (the FFT path of the SRB is computed in FP32) |
 | loss | `5.0 L_pix + 0.5 L_fft + 1.0 L_perc + 1.0 L_ssim + 1.0 L_id + 0.5 L_edge` (definitions in `Loss.py`) |
-| budget | full model: 100 epochs, one epoch = ⌊N_train / 6⌋ iterations; every ablation run: 20 epochs (identical reduced budget). Iterations and wall-clock time are written to `run.json` and `tables/section41_runs.csv` |
+| budget | full model: 100 epochs, one epoch = ⌊N_train / 6⌋ iterations (≈ 0.4 M iterations); every ablation run: 10 epochs (identical reduced budget for all 46 runs). Iterations and wall-clock time are written to `run.json` and `tables/section41_runs.csv` |
 | stopping / selection | fixed budget, no early stopping; the reported checkpoint is the one with the best mean PSNR on a validation split held out from the training pool (10 pairs per category, centre 256 × 256 crops, never a test image) |
 | seeds | full model seed 1; ablations seeds 1, 2, 3 (TODO-12A) or 1; data subsets seeded (`DATA_SUBSET_SEED` = 2026), synthetic test degradations seeded per image |
 | frozen networks | VGG-19 and ResNet-50 / ConvNeXt-T with torchvision `IMAGENET1K_V1` weights, always in eval mode; the loss networks (VGG-19 perceptual, ResNet-50 identity) exist only during training |
@@ -60,7 +60,7 @@ Each category is capped at 2,500 pairs (seeded random subset). Köhler has no tr
 
 ## Running
 
-Open `KASIRNet.ipynb` in Colab with the G4 runtime and *Run all*. Datasets are downloaded with `kagglehub` and the official Google-Drive archives (Snow100K, DPDD test); outputs go to `Config.OUTPUT_ROOT` on Google Drive. Stages are idempotent and every run checkpoints every 2,000 iterations, so a session that ends is resumed by running the notebook again (resumption is bit-exact). Competitor outputs held by the authors are read from `Config.COMPETITOR_ROOT/<benchmark>/<method>/` (files named like the test inputs).
+Open `KASIRNet.ipynb` in Colab with the G4 runtime and *Run all*. Datasets are downloaded with `kagglehub` and the official Google-Drive archives (Snow100K, DPDD test); outputs go to `Config.OUTPUT_ROOT` on Google Drive. Stages are idempotent and every run checkpoints every 2,000 iterations, so a session that ends is resumed by running the notebook again (resumption is bit-exact). Several G4 sessions can run the notebook at the same time on the same Drive folder: a run in training is locked, so the sessions split the ablation queue. Competitor outputs held by the authors are read from `Config.COMPETITOR_ROOT/<benchmark>/<method>/` (files named like the test inputs).
 
 Outputs used by the manuscript (all under `OUTPUT_ROOT/tables`, CSV + LaTeX rows, PSNR with two decimals, SSIM with three):
 

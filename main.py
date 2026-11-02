@@ -11,7 +11,7 @@ import torch
 
 from Config import Config  # nb:skip
 from Datasets import resolve_sources, spec_sources, build_training_manifest, BenchmarkDataset  # nb:skip
-from Trainer import Trainer, read_json, write_json  # nb:skip
+from Trainer import Trainer, read_json, write_json, try_lock, release_lock  # nb:skip
 from Inferencer import Evaluator, KASIRNetInferencer  # nb:skip
 from Analysis import (step0_audit, cost_report, significance_report, prompt_probe_report, severity_report,  # nb:skip
                       feature_stability_report, spectral_report, qualitative_figures, ablation_tables,  # nb:skip
@@ -101,10 +101,24 @@ class Experiment:
         roots = self.roots(['jrdr', 'rain100l', 'legacy_raining'])
         step0_audit(self.cfg, roots, self.device)
 
+    def train(self, run):
+        """Train one run unless another live session holds it.  Returns its status."""
+        rid = run['run_id']
+        if self.complete(rid):
+            return 'complete'
+        if not try_lock(self.cfg, rid):
+            print(f'[{rid}] being trained by another session -> skipped here')
+            return 'locked'
+        try:
+            rec = Trainer(self.cfg, run, self.manifest(), self.device).fit()
+        finally:
+            release_lock(self.cfg, rid)
+            self.free()
+        return rec.get('status')
+
     def stage_train_full(self):
-        rec = Trainer(self.cfg, self.cfg.full_run(), self.manifest(), self.device).fit()
-        self.free()
-        if rec.get('status') != 'complete':
+        st = self.train(self.cfg.full_run())
+        if st == 'paused':
             self.stop = True
 
     def stage_eval_full(self):
@@ -173,14 +187,12 @@ class Experiment:
                       f'= about {len(todo) * it * np.median(hist) / 3600:.0f} GPU-hours')
         self.bench_roots(cfg.ABLATION_BENCHMARKS)
         for run in plan:
-            rid = run['run_id']
-            if not self.complete(rid):
-                rec = Trainer(cfg, run, self.manifest(), self.device).fit()
-                self.free()
-                if rec.get('status') != 'complete':
-                    self.stop = True
-                    return
-            self.evaluate_many(rid, cfg.ABLATION_BENCHMARKS, metric_names=('psnr', 'ssim'))
+            st = self.train(run)
+            if st == 'paused':
+                self.stop = True
+                return
+            if st == 'complete':
+                self.evaluate_many(run['run_id'], cfg.ABLATION_BENCHMARKS, metric_names=('psnr', 'ssim'))
 
     def stage_analyses_ablation(self):
         cfg = self.cfg

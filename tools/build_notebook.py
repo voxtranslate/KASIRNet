@@ -25,9 +25,11 @@ Each code cell below is **identical** to the module of the same name in the repo
 | `train_full` | full KASIRNet, paper hyper-parameters (batch 6, Adam 1e-4, cosine, clip 1.0, FP16, six loss weights 5/0.5/1/1/1/0.5), `EPOCHS` = 100 | `checkpoints/KASIRNet_full/final.pth`, `runs/KASIRNet_full/{run.json, curves.png, history_*.csv}` |
 | `eval_full` | 8 benchmarks + Rain100H + Snow100K-S/M + Gaussian σ15/25/50 + LIVE1/LOL/DPDD at full resolution | `runs/KASIRNet_full/eval/<bench>/per_image.csv` (PSNR, SSIM, LPIPS, DISTS), `summary.json` |
 | `analyses_full` | cost (TODO-13), bootstrap CI + Wilcoxon (TODO-12C), LPIPS/DISTS + divergent % (TODO-14), prompt probe + mixed sets (TODO-16), spectral/phase analysis, feature stability, Figs. S1/S2 (TODO-06), explainability | `tables/`, `analysis/` |
-| `ablations` | 46 reduced-budget runs (`ABLATION_EPOCHS` = 20 for every run): TODO-12A (5 variants × 3 seeds), TODO-09B (extractors), TODO-12B (interactions), TODO-15 (loss weights ×0.5/×2), Table 6 rows, Table 7 rows, SCWAM design | `runs/<run_id>/run.json` + GoPro/Rain100L/SIDD per-image CSVs |
+| `ablations` | 46 reduced-budget runs (`ABLATION_EPOCHS` = 10 for every run): TODO-12A (5 variants × 3 seeds), TODO-09B (extractors), TODO-12B (interactions), TODO-15 (loss weights ×0.5/×2), Table 6 rows, Table 7 rows, SCWAM design | `runs/<run_id>/run.json` + GoPro/Rain100L/SIDD per-image CSVs |
 | `analyses_ablation` | SIM vs severity (TODO-09A) and all ablation tables | `tables/table6…`, `table7…`, `table8…`, `table9…`, `table12…` |
 | `tables` | Tables 4/5, Rain100H (TODO-02), zero-shot (TODO-17), Section 4.1 reproducibility summary | `tables/*.csv`, `tables/*.tex` |
+
+**Parallel sessions.** If more than one G4 session is available, open this notebook in each of them (same Google account / Drive) and *Run all*: a run being trained holds a lock with a heartbeat, so the sessions share the ablation queue without training the same run twice (`Config.LOCK_STALE_MINUTES`). The measured s/iteration and the GPU-hours left are printed at the start of the `ablations` stage.
 
 Competitor outputs that the authors hold (HIDE Restormer, TextOCR CNN-ViT, Köhler Rahman et al., RESIDE-6K ADSM, SIDD Defusion; Rain100L / Snow100K-L methods for Figs. S1/S2) are read from `Config.COMPETITOR_ROOT` and scored with the same metric function.
 """

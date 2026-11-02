@@ -17,6 +17,7 @@ import csv
 import json
 import math
 import time
+import uuid
 import random
 import platform
 import numpy as np
@@ -103,6 +104,28 @@ class ResumableSampler(Sampler):
 
     def __len__(self):
         return self.n - self.start
+
+
+SESSION_ID = uuid.uuid4().hex[:12]
+
+
+def lock_path(cfg, run_id):
+    return os.path.join(cfg.run_dir(run_id), 'LOCK.json')
+
+
+def try_lock(cfg, run_id):
+    """True if this session may train `run_id` (no other live session holds it)."""
+    lk = read_json(lock_path(cfg, run_id))
+    if lk and lk.get('session') != SESSION_ID and time.time() - lk.get('heartbeat', 0) < cfg.LOCK_STALE_MINUTES * 60:
+        return False
+    write_json(dict(session=SESSION_ID, host=platform.node(), heartbeat=time.time()), lock_path(cfg, run_id))
+    return True
+
+
+def release_lock(cfg, run_id):
+    lk = read_json(lock_path(cfg, run_id))
+    if lk and lk.get('session') == SESSION_ID:
+        os.remove(lock_path(cfg, run_id))
 
 
 def build_model(cfg, run):
@@ -332,6 +355,7 @@ class Trainer:
                     self._validate_and_select()
                 if self.iteration % cfg.CKPT_EVERY_ITERS == 0:
                     atomic_save(self._state(), self._ckpt('last.pth'))
+                    write_json(dict(session=SESSION_ID, host=platform.node(), heartbeat=time.time()), lock_path(cfg, self.run_id))
                     self._write_record('running')
                     self._write_curves()
                 if self.iteration >= self.total_iters:
