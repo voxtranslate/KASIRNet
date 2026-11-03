@@ -20,7 +20,12 @@ import time
 import uuid
 import random
 import platform
+import warnings
 import numpy as np
+
+# With FP16 the GradScaler skips the optimiser step of the first iterations (inf gradients while it
+# calibrates its scale); PyTorch then warns that the scheduler stepped first.  Harmless and expected.
+warnings.filterwarnings('ignore', message='Detected call of `lr_scheduler.step\\(\\)` before `optimizer.step\\(\\)`')
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Sampler

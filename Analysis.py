@@ -923,6 +923,8 @@ def main_tables(cfg, run_id):
 def section41_report(cfg):
     runs = []
     for rid, run in cfg.all_runs().items():
+        if rid == cfg.full_alias():
+            continue
         rec = read_json(os.path.join(cfg.run_dir(rid), 'run.json'))
         if rec and 'budget' in rec:
             runs.append(dict(run_id=rid, group=rec['group'], seed=rec['seed'], status=rec['status'],

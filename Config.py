@@ -189,7 +189,7 @@ class Config:
         # ---- TODO-16 mixed degradations (second degradation added to the first one)
         'mix_gopro_g25':      dict(family='mixed', base='gopro', degrade=[('gaussian', 25)], families=('blur', 'noise')),
         'mix_rain100l_haze':  dict(family='mixed', base='rain100l', degrade=[('haze', 1.0, 0.8)], families=('rain', 'haze')),
-        'mix_snow100kl_g25':  dict(family='mixed', base='snow100k_l', degrade=[('gaussian', 25)], families=('snow', 'noise'), max_images=2000),
+        'mix_snow100kl_g25':  dict(family='mixed', base='snow100k_l', degrade=[('gaussian', 25)], families=('snow', 'noise')),
     }
     MAIN_BENCHMARKS = ['gopro', 'hide', 'textocr', 'kohler', 'rain100l', 'reside6k', 'snow100k_l', 'sidd']
     EXTRA_BENCHMARKS = ['rain100h', 'snow100k_s', 'snow100k_m', 'cbsd68_g15', 'cbsd68_g25', 'cbsd68_g50',
@@ -200,20 +200,20 @@ class Config:
 
     # ----------------------------------------------- training (Section 4.1)
     PATCH_SIZE = 256
-    BATCH_SIZE = 6
+    BATCH_SIZE = 64               # G4 (96 GB); Section 4.1 must state batch 64 (the submitted paper said 6)
     LR = 1e-4
     BETAS = (0.9, 0.999)
     WEIGHT_DECAY = 0.0
     ETA_MIN = 1e-7                # cosine annealing per iteration from LR to ETA_MIN over the whole budget
     GRAD_CLIP = 1.0
     # Budget.  One epoch = one pass over the (capped, repeated) training pool, i.e.
-    # floor(N_train / BATCH_SIZE) iterations (about 22,900 samples -> 3,800 iterations for this pool).
-    # The full model gets 100 epochs (~0.38 M iterations, ~2.3 M patches).  Every ablation run gets
-    # the identical reduced budget B = 10 epochs (one tenth): 46 runs x B = 4.6 full-run equivalents.
-    # main() prints the measured s/iteration and the GPU-hours left for the whole plan; raise
-    # ABLATION_EPOCHS if the deadline allows (all ablation runs must share the same value).
+    # floor(N_train / BATCH_SIZE) iterations (22,871 samples -> 357 iterations at batch 64).
+    # The full model gets 100 epochs (35,700 iterations, ~2.3 M patches) and every ablation run gets
+    # exactly the same budget (ABLATION_EPOCHS = EPOCHS).  With equal budgets the ablation reference
+    # "full, seed SEED" is the full model itself: it is trained once (run KASIRNet_full) and reused,
+    # never trained a second time.  main() prints the measured s/iteration and the GPU-hours left.
     EPOCHS = 100
-    ABLATION_EPOCHS = 10
+    ABLATION_EPOCHS = 100
     CKPT_EVERY_ITERS = 2000       # resumable checkpoint (atomic write) every N iterations
     VAL_EVERY_ITERS = 5000
     LOG_EVERY_ITERS = 100
@@ -257,8 +257,17 @@ class Config:
         self.LOSS_WEIGHTS = copy.deepcopy(self.LOSS_WEIGHTS)
 
     # paths
-    def ckpt_dir(self, run_id):   return os.path.join(self.OUTPUT_ROOT, 'checkpoints', run_id)
-    def run_dir(self, run_id):    return os.path.join(self.OUTPUT_ROOT, 'runs', run_id)
+    def full_alias(self):
+        """Ablation run id that is identical to the full model (same seed, budget, model and loss), or None."""
+        if self.ABLATION_EPOCHS == self.EPOCHS and self.SEED in self.ABLATION_SEEDS:
+            return f'full_s{self.SEED}'
+        return None
+
+    def resolve_run(self, run_id):
+        return self.FULL_RUN_ID if run_id == self.full_alias() else run_id
+
+    def ckpt_dir(self, run_id):   return os.path.join(self.OUTPUT_ROOT, 'checkpoints', self.resolve_run(run_id))
+    def run_dir(self, run_id):    return os.path.join(self.OUTPUT_ROOT, 'runs', self.resolve_run(run_id))
     def analysis_dir(self, name): return os.path.join(self.OUTPUT_ROOT, 'analysis', name)
     @property
     def tables_dir(self):         return os.path.join(self.OUTPUT_ROOT, 'tables')
@@ -322,6 +331,7 @@ class Config:
     def ablation_plan(self):
         groups = self.ablation_groups()
         plan, seen = [], set()
+        seen.add(self.full_alias())   # trained once as the full model, never again
         for g in self.RUN_ABLATION_GROUPS:
             for r in groups[g]:
                 if r['run_id'] not in seen:

@@ -31,11 +31,11 @@ KASIRNet is a four-scale U-Net trained once on a pool of degradation categories 
 |---|---|
 | hardware | 1 × NVIDIA RTX PRO 6000 Blackwell Server Edition 96 GB (Colab G4 runtime); exact device/driver/CUDA/cuDNN/PyTorch versions are recorded in each `run.json` |
 | patches | 256 × 256 random crops, random horizontal and vertical flips; images whose shorter side is below 256 (CelebA, 178 × 218) are first up-scaled with bicubic interpolation keeping the aspect ratio |
-| batch / optimiser | 6 / Adam (β = 0.9, 0.999), learning rate 1e-4, no weight decay |
+| batch / optimiser | 64 / Adam (β = 0.9, 0.999), learning rate 1e-4, no weight decay |
 | schedule | cosine annealing per iteration from 1e-4 to 1e-7 over the whole budget, gradient-norm clipping 1.0 |
 | precision | FP16 autocast + GradScaler (the FFT path of the SRB is computed in FP32) |
 | loss | `5.0 L_pix + 0.5 L_fft + 1.0 L_perc + 1.0 L_ssim + 1.0 L_id + 0.5 L_edge` (definitions in `Loss.py`) |
-| budget | full model: 100 epochs, one epoch = ⌊N_train / 6⌋ iterations (≈ 3,800 iterations per epoch, ≈ 0.38 M iterations); every ablation run: 10 epochs (identical reduced budget for all 46 runs). Iterations and wall-clock time are written to `run.json` and `tables/section41_runs.csv` |
+| budget | 100 epochs for the full model and for every ablation run (one epoch = ⌊22,871 / 64⌋ = 357 iterations, 35,700 iterations per run). The ablation reference “full, seed 1” is the full model itself (trained once, not twice), so 45 ablation runs are trained. Iterations and wall-clock time are written to `run.json` and `tables/section41_runs.csv` |
 | stopping / selection | fixed budget, no early stopping; the reported checkpoint is the one with the best mean PSNR on a validation split held out from the training pool (10 pairs per category, centre 256 × 256 crops, never a test image) |
 | seeds | full model seed 1; ablations seeds 1, 2, 3 (TODO-12A) or 1; data subsets seeded (`DATA_SUBSET_SEED` = 2026), synthetic test degradations seeded per image |
 | frozen networks | VGG-19 and ResNet-50 / ConvNeXt-T with torchvision `IMAGENET1K_V1` weights, always in eval mode; the loss networks (VGG-19 perceptual, ResNet-50 identity) exist only during training |
