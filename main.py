@@ -11,7 +11,8 @@ import torch
 
 from Config import Config  # nb:skip
 from Datasets import (resolve_sources, spec_sources, build_training_manifest, BenchmarkDataset, DatasetCache,  # nb:skip
-                      manifest_is_current, overlap_benchmarks, manifest_used_files, validate_data, resolve_path)  # nb:skip
+                      manifest_is_current, overlap_benchmarks, manifest_used_files, validate_data, resolve_path,  # nb:skip
+                      benchmark_files)  # nb:skip
 from Trainer import Trainer, read_json, write_json, try_lock, release_lock  # nb:skip
 from Inferencer import Evaluator, KASIRNetInferencer  # nb:skip
 from Analysis import (step0_audit, cost_report, significance_report, prompt_probe_report, severity_report,  # nb:skip
@@ -72,6 +73,27 @@ class Experiment:
             self._manifest = build_training_manifest(self.cfg, self.roots(keys, need_full=not current))
         return self._manifest
 
+    def all_source_keys(self):
+        b = self.cfg.benchmarks()
+        keys = [k for s in self.cfg.train_categories().values() for k in spec_sources(s)]
+        keys += [k for n in b for k in spec_sources(b[n], b)]
+        return sorted(set(keys + ['jrdr', 'rain100l', 'legacy_raining']))
+
+    def cache_benchmark_sources(self):
+        """Sources read only by benchmarks are cached right after their download (their files are known
+        without the training manifest), so a later failure in the audit cannot waste the download."""
+        train_keys = {k for s in self.cfg.train_categories().values() for k in spec_sources(s)}
+        files = {}
+        for name in self.cfg.benchmarks():
+            try:
+                for k, r in benchmark_files(self.cfg, self._roots, name):
+                    files.setdefault(k, set()).add(r)
+            except (FileNotFoundError, KeyError):
+                pass
+        for k, root in sorted(self._roots.items()):
+            if self._origin.get(k) == 'origin' and k not in train_keys and k in files:
+                self.cache.store(k, root, files[k])
+
     def cache_sources(self):
         """Pack every source downloaded in this session into the Drive cache."""
         if self.cfg.DATA_CACHE_MODE == 'off':
@@ -126,9 +148,16 @@ class Experiment:
         """Step 0: all sources (Drive cache or download), frozen training manifest with the leakage
         audit, validation of every training category and benchmark, Step-0 facts, Drive cache."""
         cfg = self.cfg
+        keys = self.all_source_keys()
+        self.cache.inventory(keys)
+        self.roots(keys, need_full=not manifest_is_current(cfg))
+        self.cache_benchmark_sources()
+        missing = [k for k in keys if k not in self._roots]
+        if missing:
+            raise RuntimeError(f'data sources not available in this session: {missing}. The reason is printed above '
+                               f'(e.g. Google-Drive "quota exceeded": run again later, or place the archive in '
+                               f'{cfg.DATA_CACHE_ROOT}/archives/). Everything downloaded so far is kept.')
         man = self.manifest()
-        b = cfg.benchmarks()
-        self.roots([k for n in b for k in spec_sources(b[n], b)] + ['jrdr', 'rain100l', 'legacy_raining'])
         if not os.path.exists(os.path.join(cfg.manifest_dir, 'data_validation.json')):
             validate_data(cfg, self._roots, man)
         if not os.path.exists(os.path.join(cfg.analysis_dir('step0_facts'), 'facts.json')):

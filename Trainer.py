@@ -189,6 +189,7 @@ class Trainer:
 
     def _state(self, full=True):
         s = dict(run_id=self.run_id, iteration=self.iteration, total_iters=self.total_iters,
+                 manifest_signature=self.manifest['signature'],
                  model_state_dict=self.model.state_dict(), model_flags=self.cfg.model_kwargs(self.run),
                  loss_weights=self.cfg.loss_weights(self.run), best_val_psnr=self.best_val, best_iter=self.best_iter)
         if full:
@@ -204,6 +205,16 @@ class Trainer:
         if not os.path.exists(path):
             return
         ck = torch.load(path, map_location=self.device, weights_only=False)
+        prev = ck.get('manifest_signature') or self.record.get('data', {}).get('manifest_signature')
+        if prev and prev != self.manifest['signature']:
+            # the training pool changed: resuming would mix two pools inside one run -> restart this run
+            for n in ('last.pth', 'best.pth'):
+                if os.path.exists(self._ckpt(n)):
+                    os.replace(self._ckpt(n), self._ckpt(n.replace('.pth', '_previous_pool.pth')))
+            print(f'[{self.run_id}] !! the training pool changed since this checkpoint (iteration {ck["iteration"]}): '
+                  f'the run restarts from scratch so that it is trained on one pool only (old checkpoint kept as last_previous_pool.pth)')
+            self.record = {}
+            return
         if ck.get('total_iters') != self.total_iters:
             print(f'[{self.run_id}] !! the budget changed since the checkpoint ({ck.get("total_iters")} -> {self.total_iters} '
                   f'iterations, e.g. EPOCHS or the training pool changed); the cosine schedule follows the new budget')

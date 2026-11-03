@@ -47,6 +47,10 @@ class Config:
     #   'full' : the complete sources (about 55 GB of Drive space)   |   'off': no cache
     DATA_CACHE_ROOT = '/content/drive/MyDrive/KASIRNet_revision/datasets_cache'
     DATA_CACHE_MODE = 'used'
+    # Which sources go to the Drive cache.  'fragile' (default): the Google-Drive and Hugging Face downloads
+    # (Snow100K test, Snow100K train, DPDD; about 7 GB) - Kaggle sources are fast and mirrored by Colab, so
+    # caching them would only fill the Drive quota (about 40 GB).  'all': every source.
+    DATA_CACHE_SOURCES = 'fragile'
     DATA_CACHE_REFRESH = False    # True: rebuild the tars of this session's sources
     # Google-Drive archives often fail with "quota exceeded".  A copy of the archive placed by hand in
     # DATA_CACHE_ROOT/archives/<file name> (Drive web page -> "Make a copy" / "Add shortcut") is used first.
@@ -91,8 +95,15 @@ class Config:
     # Google-Drive archives (official links of the dataset authors).  Layouts checked on the archives:
     # training tar -> all/{gt,mask,synthetic}; test tar -> media/jdway/GameSSD/overlapping/test/Snow100K-{S,M,L}/{gt,mask,synthetic}
     GDOWN_SOURCES = {
-        'snow100k_train': dict(id='1SGS2w2RBhfwAMn9dMQZUnoQcqCcz1baU', file='Snow100K-training.tar.gz'),
         'snow100k_test':  dict(id='15z-A3i3Z2ybdKuyxwYRA8YKxIA8_kTDm', file='Snow100K-testset.tar.gz'),
+    }
+    # Snow100K training data: 2,500 pairs of the official training set (the subset released with ConvIR,
+    # Hugging Face mirror, no Google-Drive quota).  Checked: all 2,500 names belong to the official
+    # training set (all/synthetic), none to the S/M/L test sets, synthetic and gt names match 1:1.
+    # The official 7.8 GB training archive (id 1SGS2w2RBhfwAMn9dMQZUnoQcqCcz1baU) often fails with
+    # "quota exceeded"; with MAX_PER_CATEGORY = 2500 the subset is exactly the amount used.
+    HF_ZIP_SOURCES = {
+        'snow100k_train': dict(repo='fancongyi/snow100k', file='Snow100K_ConvIR.zip'),
     }
     # Hugging Face parquet mirrors.  DPDD test (76 pairs, 1680x1120, original file names, combined image
     # 'source' = inputC, 'target'); the official Google-Drive file (DPDD_GDOWN_ID) is the fallback.
@@ -128,7 +139,7 @@ class Config:
                            match=('regex', r'(\d+)_rain', r'(\d+)_clean'), direction='contrast_gt'),
         'haze':       dict(family='haze',  input=('reside6k', 'RESIDE-6K/train/hazy'), gt=('reside6k', 'RESIDE-6K/train/GT'),
                            exclude_overlap_with=['reside6k']),
-        'snow':       dict(family='snow',  input=('snow100k_train', '**/synthetic'), gt=('snow100k_train', '**/gt')),
+        'snow':       dict(family='snow',  input=('snow100k_train', 'Snow100K/train2500/Snow'), gt=('snow100k_train', 'Snow100K/train2500/Gt')),
         'sidd':       dict(family='noise', root=('sidd', 'train/train'), input_glob='**/*NOISY_SRGB_*.PNG', gt_replace=('NOISY', 'GT'),
                            repeat=8),   # 320 very large images: 8 random crops of each per epoch
         'sp_noise':   dict(family='noise', input=('sp_noise', 'Noisy_folder'), gt=('sp_noise', 'Ground_truth'),

@@ -63,8 +63,9 @@ def _download_gdown(cfg, key):
         import gdown
         out = gdown.download(id=src['id'], output=archive, quiet=False)
         if out is None or not os.path.exists(archive):
-            raise RuntimeError(f'Google-Drive download of {src["file"]} failed (often "quota exceeded"). Open '
-                               f'https://drive.google.com/file/d/{src["id"]}, make a copy and put it at {manual}')
+            raise RuntimeError(f'Google-Drive download of {src["file"]} failed (often "quota exceeded", resets within 24 h). '
+                               f'Either run again later, or open https://drive.google.com/file/d/{src["id"]} in the browser, '
+                               f'download it and upload it to {manual}')
     print(f'[data] extracting {archive} -> {dest}')
     _extract(archive, dest, stream=not archive.endswith('.zip'))
     open(_done(dest), 'w').write('ok')
@@ -106,7 +107,27 @@ def _download_hf_parquet(cfg, key):
     return dest
 
 
+def _download_hf_zip(cfg, key):
+    spec = cfg.HF_ZIP_SOURCES[key]
+    dest = os.path.join(cfg.DATA_ROOT, key)
+    if os.path.exists(_done(dest)):
+        return dest
+    import urllib.request
+    os.makedirs(dest, exist_ok=True)
+    local = os.path.join(cfg.DATA_ROOT, key + '_' + spec['file'])
+    url = f'https://huggingface.co/datasets/{spec["repo"]}/resolve/main/{spec["file"]}'
+    print(f'[data] downloading {url}')
+    urllib.request.urlretrieve(url, local + '.part')
+    os.replace(local + '.part', local)
+    _extract(local, dest)
+    os.remove(local)
+    open(_done(dest), 'w').write('ok')
+    return dest
+
+
 def download_source(cfg, key):
+    if key in cfg.HF_ZIP_SOURCES:
+        return _download_hf_zip(cfg, key)
     if key in cfg.KAGGLE_SOURCES:
         import kagglehub
         return kagglehub.dataset_download(cfg.KAGGLE_SOURCES[key])
@@ -147,6 +168,9 @@ class DatasetCache:
         m = self.info(key)
         if m is None or (need_full and m['mode'] != 'full'):
             return None
+        if os.path.getsize(self._tar(key)) < m['bytes']:
+            print(f'[cache] !! {key}: the tar on Drive is incomplete (upload interrupted or Drive full) -> downloaded again')
+            return None
         dest = os.path.join(self.local, key)
         marker = os.path.join(dest, '.cache_meta.json')
         if os.path.exists(marker) and json.load(open(marker)).get('created') == m['created']:
@@ -159,10 +183,34 @@ class DatasetCache:
         json.dump(m, open(marker, 'w'))
         return dest
 
+    def wanted(self, key):
+        if self.mode == 'off':
+            return False
+        if getattr(self.cfg, 'DATA_CACHE_SOURCES', 'fragile') == 'all':
+            return True
+        return key in self.cfg.GDOWN_SOURCES or key in self.cfg.HF_PARQUET_SOURCES or key in self.cfg.HF_ZIP_SOURCES
+
+    def inventory(self, keys):
+        """Print what the Drive cache holds (helps to see a cache lost to a full Drive)."""
+        import shutil
+        try:
+            free = shutil.disk_usage(self.root if os.path.isdir(self.root) else os.path.dirname(self.root)).free / 1e9
+        except OSError:
+            free = float('nan')
+        print(f'[cache] {self.root}  (free space reported for this Drive: {free:.1f} GB)')
+        for k in sorted(set(keys)):
+            m, t = self.info(k), self._tar(k)
+            state = (f'cached, {m["mode"]}, {m["n_files"]} files, {m["bytes"] / 1e9:.2f} GB' if m else
+                     ('tar without metadata (incomplete upload?)' if os.path.exists(t) else
+                      ('not cached' if self.wanted(k) else 'not cached (Kaggle source, downloaded each session)')))
+            if m and os.path.getsize(t) < m['bytes']:
+                state += f'  !! tar is only {os.path.getsize(t) / 1e9:.2f} GB: incomplete, will be rebuilt'
+            print(f'          {k:16s} {state}')
+
     def store(self, key, root, relfiles=None):
         """relfiles=None or mode 'full' -> the whole source.  Never overwrites an existing cache
         unless DATA_CACHE_REFRESH (a 'full' cache is never replaced by a 'used' one)."""
-        if self.mode == 'off' or root.startswith(self.local):
+        if not self.wanted(key) or root.startswith(self.local):
             return
         m = self.info(key)
         if m is not None and not self.cfg.DATA_CACHE_REFRESH:
@@ -175,6 +223,15 @@ class DatasetCache:
             files, mode = list(relfiles), 'used'
         files = sorted(set(files))
         os.makedirs(self.root, exist_ok=True)
+        need = sum(os.path.getsize(os.path.join(root, f)) for f in files)
+        try:
+            import shutil
+            free = shutil.disk_usage(self.root).free
+            if free < need * 1.05:
+                print(f'[cache] !! {key}: needs {need / 1e9:.2f} GB but the Drive has {free / 1e9:.2f} GB free -> not cached')
+                return
+        except OSError:
+            pass
         tmp = self._tar(key) + '.tmp'
         total = 0
         try:
@@ -433,6 +490,10 @@ def overlap_benchmarks(cfg):
 
 def resolve_manifest(man, roots):
     """Copy of the manifest with absolute paths for this session."""
+    missing = sorted({it[k] for s in ('train', 'val') for it in man[s] for k in ('src_in', 'src_gt')} - set(roots))
+    if missing:
+        raise FileNotFoundError(f'data sources needed by the training manifest are not available: {missing} '
+                                f'(see the download messages above)')
     out = dict(man)
     for split in ('train', 'val'):
         out[split] = [dict(it, input=os.path.join(roots[it['src_in']], it['input']),
