@@ -106,7 +106,17 @@ class WindowAttention(nn.Module):
             bias = bias.unsqueeze(0).to(q.dtype)
 
         if self.use_fused:
-            x = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
+            # CUDA fused kernels launch one block per (window, head): their grid is limited to 65,535 in that
+            # dimension (batch 64 x 1,024 windows x 2 heads exceeds it -> 'CUDA error: invalid argument').
+            # The windows are therefore processed in chunks; the result is identical.
+            step = max(1, 65535 // (2 * self.num_heads))
+            if B_ <= step:
+                x = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
+            else:
+                x = torch.cat([F.scaled_dot_product_attention(
+                    q[s:s + step], k[s:s + step], v[s:s + step],
+                    attn_mask=None if bias is None else (bias if bias.shape[0] == 1 else bias[s:s + step]))
+                    for s in range(0, B_, step)], dim=0)
         else:
             attn = (q @ k.transpose(-2, -1)) * self.scale
             if bias is not None:
