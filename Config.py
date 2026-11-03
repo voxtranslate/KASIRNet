@@ -91,19 +91,90 @@ class Config:
         'lol':      'soumikrakshit/lol-dataset',               # LOL eval15
         'live1':    'nikshko/live-1',                          # LIVE1 references (29 bmp)
         'legacy_raining': 'adeshpal/image-deraining',          # audit only: the "raining" category of the submitted pool
+        'snow_test_l': 'suzukimio/allweather-testing',         # Snow100K-L official test set (16,801 pairs, AllWeather_Testing/Snow100K-L);
+                                                               # names and byte sizes identical to the official archive
     }
     # Google-Drive archives (official links of the dataset authors).  Layouts checked on the archives:
     # training tar -> all/{gt,mask,synthetic}; test tar -> media/jdway/GameSSD/overlapping/test/Snow100K-{S,M,L}/{gt,mask,synthetic}
-    GDOWN_SOURCES = {
-        'snow100k_test':  dict(id='15z-A3i3Z2ybdKuyxwYRA8YKxIA8_kTDm', file='Snow100K-testset.tar.gz'),
-    }
-    # Snow100K training data: 2,500 pairs of the official training set (the subset released with ConvIR,
-    # Hugging Face mirror, no Google-Drive quota).  Checked: all 2,500 names belong to the official
-    # training set (all/synthetic), none to the S/M/L test sets, synthetic and gt names match 1:1.
-    # The official 7.8 GB training archive (id 1SGS2w2RBhfwAMn9dMQZUnoQcqCcz1baU) often fails with
-    # "quota exceeded"; with MAX_PER_CATEGORY = 2500 the subset is exactly the amount used.
+    # (The official Snow100K Google-Drive archives - training 1SGS2w2RBhfwAMn9dMQZUnoQcqCcz1baU, test
+    # 15z-A3i3Z2ybdKuyxwYRA8YKxIA8_kTDm - fail repeatedly with "quota exceeded"; they are no longer used.)
+    GDOWN_SOURCES = {}
+    # Snow100K from Hugging Face (the archive released with ConvIR, no quota): train2500 = 2,500 pairs of the
+    # official training set; test2000 = 713 Snow100K-S + 662 Snow100K-M + 625 Snow100K-L official test pairs.
+    # Checked against the official archive listings: every file has the official name and byte size.
     HF_ZIP_SOURCES = {
-        'snow100k_train': dict(repo='fancongyi/snow100k', file='Snow100K_ConvIR.zip'),
+        'snow100k_hf': dict(repo='fancongyi/snow100k', file='Snow100K_ConvIR.zip'),
+    }
+    # names of the Snow100K-S / -M official test images contained in test2000 (zlib + base64)
+    SNOW_LEVEL_NAMES = {
+        'S': (
+        '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'),
+        'M': (
+        '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'
+        '4CntbCTTBfnW8CneJ+L7i6+3/CAaVS'),
     }
     # Hugging Face parquet mirrors.  DPDD test (76 pairs, 1680x1120, original file names, combined image
     # 'source' = inputC, 'target'); the official Google-Drive file (DPDD_GDOWN_ID) is the fallback.
@@ -139,7 +210,7 @@ class Config:
                            match=('regex', r'(\d+)_rain', r'(\d+)_clean'), direction='contrast_gt'),
         'haze':       dict(family='haze',  input=('reside6k', 'RESIDE-6K/train/hazy'), gt=('reside6k', 'RESIDE-6K/train/GT'),
                            exclude_overlap_with=['reside6k']),
-        'snow':       dict(family='snow',  input=('snow100k_train', 'Snow100K/train2500/Snow'), gt=('snow100k_train', 'Snow100K/train2500/Gt')),
+        'snow':       dict(family='snow',  input=('snow100k_hf', 'Snow100K/train2500/Snow'), gt=('snow100k_hf', 'Snow100K/train2500/Gt')),
         'sidd':       dict(family='noise', root=('sidd', 'train/train'), input_glob='**/*NOISY_SRGB_*.PNG', gt_replace=('NOISY', 'GT'),
                            repeat=8),   # 320 very large images: 8 random crops of each per epoch
         'sp_noise':   dict(family='noise', input=('sp_noise', 'Noisy_folder'), gt=('sp_noise', 'Ground_truth'),
@@ -183,13 +254,14 @@ class Config:
         'kohler':     dict(family='blur',  input=('kohler', 'kohler/blur'), gt=('kohler', 'kohler/sharp'), match=_KOHLER_MATCH),
         'rain100l':   dict(family='rain',  input=('rain100l', '.'), gt=('rain100l', '.'), match=('regex', r'^rain-(\d+)$', r'^norain-(\d+)$')),
         'reside6k':   dict(family='haze',  input=('reside6k', 'RESIDE-6K/test/hazy'), gt=('reside6k', 'RESIDE-6K/test/GT')),
-        'snow100k_l': dict(family='snow',  input=('snow100k_test', '**/Snow100K-L/synthetic'), gt=('snow100k_test', '**/Snow100K-L/gt')),
+        'snow100k_l': dict(family='snow',  input=('snow_test_l', 'AllWeather_Testing/Snow100K-L/input'), gt=('snow_test_l', 'AllWeather_Testing/Snow100K-L/gt')),
         'sidd':       dict(family='noise', lmdb=('sidd', 'SIDD-val-lmdb/SIDD/val/input_crops.lmdb'), lmdb_gt=('sidd', 'SIDD-val-lmdb/SIDD/val/gt_crops.lmdb')),
         # ---- TODO-02
         'rain100h':   dict(family='rain',  input=('rain100h', 'Rain100H-test/rain'), gt=('rain100h', 'Rain100H-test/norain')),
         # ---- TODO-09 Part A severity levels
-        'snow100k_s': dict(family='snow',  input=('snow100k_test', '**/Snow100K-S/synthetic'), gt=('snow100k_test', '**/Snow100K-S/gt')),
-        'snow100k_m': dict(family='snow',  input=('snow100k_test', '**/Snow100K-M/synthetic'), gt=('snow100k_test', '**/Snow100K-M/gt')),
+        # severity levels: the official S / M test images contained in the Hugging Face test2000 archive
+        'snow100k_s': dict(family='snow',  input=('snow100k_hf', 'Snow100K/test2000/Snow'), gt=('snow100k_hf', 'Snow100K/test2000/Gt'), names='S'),
+        'snow100k_m': dict(family='snow',  input=('snow100k_hf', 'Snow100K/test2000/Snow'), gt=('snow100k_hf', 'Snow100K/test2000/Gt'), names='M'),
         'cbsd68_g15': dict(family='noise', clean=('cbsd68', 'dataset/train'), degrade=[('gaussian', 15)]),
         'cbsd68_g25': dict(family='noise', clean=('cbsd68', 'dataset/train'), degrade=[('gaussian', 25)]),
         'cbsd68_g50': dict(family='noise', clean=('cbsd68', 'dataset/train'), degrade=[('gaussian', 50)]),

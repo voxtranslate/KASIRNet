@@ -27,6 +27,8 @@ from torch.utils.data import Dataset
 from PIL import Image, ImageFile
 import torchvision.transforms.functional as TF
 
+from Config import Config  # nb:skip
+
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 IMG_EXT = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')
 
@@ -364,11 +366,21 @@ def pair_by_replace(root, input_glob, gt_replace):
                        n_pairs=len(pairs), n_unmatched=missing)
 
 
+def level_names(cfg_names, level):
+    import base64
+    return {n for n in zlib.decompress(base64.b64decode(''.join(cfg_names[level]))).decode().split('\n') if n}
+
+
 def spec_pairs(spec, roots):
     if 'root' in spec:
         return pair_by_replace(resolve_path(roots, spec['root']), spec['input_glob'], spec['gt_replace'])
-    return pair_files(resolve_path(roots, spec['input']), resolve_path(roots, spec['gt']),
-                      spec.get('match', 'stem'), spec.get('include'))
+    pairs, rep = pair_files(resolve_path(roots, spec['input']), resolve_path(roots, spec['gt']),
+                            spec.get('match', 'stem'), spec.get('include'))
+    if spec.get('names'):   # subset defined by a list of file names (e.g. Snow100K-S images of test2000)
+        keep = level_names(Config.SNOW_LEVEL_NAMES, spec['names'])
+        pairs = [p for p in pairs if os.path.basename(p[0]) in keep]
+        rep = dict(rep, n_pairs=len(pairs), n_input_keys=len(keep), n_gt_keys=len(keep), subset=f'names {spec["names"]}')
+    return pairs, rep
 
 
 def spec_keys(spec):

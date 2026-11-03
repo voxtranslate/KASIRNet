@@ -54,3 +54,11 @@ The audit stage of the revised notebook (`Datasets.build_training_manifest` + `D
 | pair validation (60 pairs per set: readability, sizes, 64 × 64 correlation, direction of the degradation) | no flag on any of the 12 local training categories or 10 benchmarks; median correlation 0.88–1.00. On the submitted RainTrainH pairing the same validator reports MISPAIR (median correlation 0.11), SWAP and SIZE. |
 | image sizes | no training image below 256 px except CelebA (178 × 218); salt-and-pepper and document images are greyscale (converted to 3 identical channels) |
 | revised training pool | GoPro 2,093 + 10 val; TextOCR 2,500 + 10; CelebA 2,500 + 10; Helen 1,990 + 10; RealBlur-J 2,500 + 10; RainTrainH 1,244 + 10; RainTrainL 1,244 + 10; DeRaindrop 851 + 10; RESIDE-6K 2,500 + 10; Snow100K 2,500 + 10; SIDD-Medium 310 + 10 (× 8 crops per epoch); salt-and-pepper 290 + 10; documents 134 + 10; AlphaISP 45 + 5 |
+
+## Snow100K sources (3 Nov 2026)
+
+The official Snow100K Google-Drive archives fail repeatedly with "quota exceeded", so the revised notebook uses mirrors, each checked file by file against the complete official archive listings (names and byte sizes):
+
+* **Snow100K-L test** (main benchmark): Kaggle `suzukimio/allweather-testing`, `AllWeather_Testing/Snow100K-L`: the complete official set, 16,801 / 16,801 inputs and ground truths identical.
+* **Training**: Hugging Face `fancongyi/snow100k` (archive released with ConvIR), `train2500`: 2,500 pairs, all byte-identical to official training files and none in the test sets. The leakage audit still removes 19 + 3 of them, which are near-duplicate scenes of Snow100K-L / -M test images (e.g. consecutive photos `city_read_05768` / `city_read_05769`).
+* **Severity levels** (TODO-09A): the same archive's `test2000` holds 713 Snow100K-S, 662 Snow100K-M and 625 Snow100K-L official test pairs (byte-identical). Snow100K-S and -M are evaluated on these 713 / 662 images (selected by name, lists in `Config.SNOW_LEVEL_NAMES`), Snow100K-L on the complete set.
