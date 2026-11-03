@@ -35,16 +35,16 @@ KASIRNet is a four-scale U-Net trained once on a pool of degradation categories 
 | schedule | cosine annealing per iteration from 1e-4 to 1e-7 over the whole budget, gradient-norm clipping 1.0 |
 | precision | FP16 autocast + GradScaler (the FFT path of the SRB is computed in FP32) |
 | loss | `5.0 L_pix + 0.5 L_fft + 1.0 L_perc + 1.0 L_ssim + 1.0 L_id + 0.5 L_edge` (definitions in `Loss.py`) |
-| budget | full model: 100 epochs, one epoch = ⌊N_train / 6⌋ iterations (≈ 3,400 iterations per epoch, ≈ 0.34 M iterations); every ablation run: 10 epochs (identical reduced budget for all 46 runs). Iterations and wall-clock time are written to `run.json` and `tables/section41_runs.csv` |
+| budget | full model: 100 epochs, one epoch = ⌊N_train / 6⌋ iterations (≈ 3,800 iterations per epoch, ≈ 0.38 M iterations); every ablation run: 10 epochs (identical reduced budget for all 46 runs). Iterations and wall-clock time are written to `run.json` and `tables/section41_runs.csv` |
 | stopping / selection | fixed budget, no early stopping; the reported checkpoint is the one with the best mean PSNR on a validation split held out from the training pool (10 pairs per category, centre 256 × 256 crops, never a test image) |
 | seeds | full model seed 1; ablations seeds 1, 2, 3 (TODO-12A) or 1; data subsets seeded (`DATA_SUBSET_SEED` = 2026), synthetic test degradations seeded per image |
 | frozen networks | VGG-19 and ResNet-50 / ConvNeXt-T with torchvision `IMAGENET1K_V1` weights, always in eval mode; the loss networks (VGG-19 perceptual, ResNet-50 identity) exist only during training |
 
-### Training pool (13 categories, written to `data_manifest/train_manifest.json`)
+### Training pool (14 categories, written to `data_manifest/train_manifest.json`)
 
 | family | categories (source) |
 |---|---|
-| blur | GoPro, TextOCR, CelebA, Helen training splits (DBlur collection; the collection has no HIDE training split, so HIDE is evaluated with the standard GoPro → HIDE protocol) |
+| blur | GoPro, TextOCR, CelebA, Helen training splits (DBlur collection; the collection has no HIDE training split, so HIDE is evaluated with the standard GoPro → HIDE protocol); RealBlur-J training split (real recorded camera shake, 3,758 pairs, replaces the Köhler category of the submitted pool) |
 | rain | RainTrainH (heavy) and RainTrainL-1800 (light) from JRDR, **direction rainy → clean, pairs matched by image id, backgrounds duplicated in Rain100H/Rain100L test removed**; DeRaindrop training split (raindrops) |
 | haze | RESIDE-6K training split |
 | snow | Snow100K training set |

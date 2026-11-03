@@ -73,6 +73,7 @@ class Config:
     KAGGLE_SOURCES = {
         'dblur':    'jishnuparayilshibu/a-curated-list-of-image-deblurring-datasets',  # GoPro train/test, HIDE test only, TextOCR, CelebA, Helen
         'kohler':   'eshapahwa1302/kohlerdeblur',              # 4 scenes x 12 kernels = 48 pairs
+        'realblur_j': 'adwythdarsanr/realblurj-image-deblurring-dataset',  # RealBlur-J official split: train 3758 (182 scenes) / test 980 (50 scenes)
         'jrdr':     'shivakanthsujit/jrdr-deraining-dataset',  # RainTrainH / RainTrainL (1800 each)
         'raindrop': 'chenchienying/deraindataset',             # DeRaindrop: train 861 / test_a 58 / test_b 249
         'rain100l': 'bshaurya/rain-dataset',                   # Rain100L test, original 481x321 (rain-/norain-xxx.png)
@@ -113,6 +114,10 @@ class Config:
         'textocr':    dict(family='blur',  input=('dblur', 'DBlur/TextOCR/train/blur'), gt=('dblur', 'DBlur/TextOCR/train/sharp')),
         'celeba':     dict(family='blur',  input=('dblur', 'DBlur/CelebA/train/blur'),  gt=('dblur', 'DBlur/CelebA/train/sharp')),
         'helen':      dict(family='blur',  input=('dblur', 'DBlur/Helen/train/blur'),   gt=('dblur', 'DBlur/Helen/train/sharp')),
+        # Real recorded camera-shake blur: replaces the Koehler category of the submitted pool (Koehler has no
+        # training split; its 48 images are now a test set only).  Official RealBlur-J training split, scenes
+        # disjoint from the RealBlur test scenes; checked against the Koehler ground truths by the leakage audit.
+        'realblur_j': dict(family='blur',  input=('realblur_j', 'RealBlur/train/blur'), gt=('realblur_j', 'RealBlur/train/gt')),
         # RainTrainH: rainy images are rain/X2/norain-NNNx2.png, clean are norain/norain-NNN.png
         'rain_heavy': dict(family='rain',  input=('jrdr', 'JRDR/rain_data_train_Heavy/rain/X2'), gt=('jrdr', 'JRDR/rain_data_train_Heavy/norain'),
                            match=_JRDR_MATCH, exclude_overlap_with=['rain100h', 'rain100l']),
@@ -202,8 +207,8 @@ class Config:
     ETA_MIN = 1e-7                # cosine annealing per iteration from LR to ETA_MIN over the whole budget
     GRAD_CLIP = 1.0
     # Budget.  One epoch = one pass over the (capped, repeated) training pool, i.e.
-    # floor(N_train / BATCH_SIZE) iterations (about 20,400 samples -> 3,400 iterations for this pool).
-    # The full model gets 100 epochs (~0.34 M iterations, ~2.0 M patches).  Every ablation run gets
+    # floor(N_train / BATCH_SIZE) iterations (about 22,900 samples -> 3,800 iterations for this pool).
+    # The full model gets 100 epochs (~0.38 M iterations, ~2.3 M patches).  Every ablation run gets
     # the identical reduced budget B = 10 epochs (one tenth): 46 runs x B = 4.6 full-run equivalents.
     # main() prints the measured s/iteration and the GPU-hours left for the whole plan; raise
     # ABLATION_EPOCHS if the deadline allows (all ablation runs must share the same value).
