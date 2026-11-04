@@ -171,18 +171,20 @@ class Experiment:
         if self._evaluator is None:
             self._evaluator = Evaluator(self.cfg, self._roots, self.device)
         self._evaluator.roots = self._roots
-        self._evaluator.protocol = self.protocol()
+        p = self.protocol()
+        if p:
+            self._evaluator.protocol = p
         return self._evaluator
 
     def protocol(self):
         """Inference protocol of every evaluation.  'auto': chosen once on the held-out validation pairs
-        with the reference full model (KASIRNet_full, trained first) and then frozen for all runs."""
+        with the reported model and then frozen for all runs (None until that model is trained)."""
         cfg = self.cfg
         if cfg.INFERENCE_PROTOCOL != 'auto':
             return cfg.INFERENCE_PROTOCOL
         if self._protocol:
             return self._protocol
-        rid = cfg.FULL_RUN_ID
+        rid = cfg.report_run_id()   # selected once with the reported model, then frozen for every run
         rec = read_json(os.path.join(cfg.run_dir(rid), 'run.json'), {})
         out_dir = cfg.analysis_dir('inference_protocol')
         key = [cfg.INFERENCE_CANDIDATES, list(cfg.INFERENCE_SELECT_MAX_SIZE), cfg.INFERENCE_SELECT_MIN_GAIN, rid,
@@ -192,7 +194,7 @@ class Experiment:
             self._protocol = sel['selected']
             return self._protocol
         if rec.get('status') != 'complete':
-            return 'full'          # nothing to select with yet (no evaluation happens before KASIRNet_full exists)
+            return None            # not selectable yet: evaluations wait (evaluate_many defers them)
         model = Evaluator(cfg, self._roots, self.device).load_run_model(cfg.all_runs()[rid])
         sel = select_inference_protocol(cfg, model, self.manifest()['val'], self.device, out_dir)
         sel['key'] = key
@@ -215,6 +217,10 @@ class Experiment:
             torch.cuda.empty_cache()
 
     def evaluate_many(self, run_id, benches, metric_names=None, save=False):
+        if self.protocol() is None:
+            print(f'[eval] {run_id}: deferred until {self.cfg.report_run_id()} is trained and the inference protocol is '
+                  f'selected (it is evaluated when the notebook runs again)')
+            return
         ev = self.evaluator()
         model = None
         for b in benches:

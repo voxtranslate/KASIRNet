@@ -16,7 +16,9 @@ class Config:
     # main() executes these stages in order; each one is idempotent (a finished run
     # or analysis is detected from its JSON and skipped), so the notebook can be
     # re-run in as many Colab sessions as needed.
-    STAGES = ['audit', 'train_full', 'train_main', 'eval_full', 'competitors', 'analyses_full', 'ablations', 'analyses_ablation', 'tables']
+    # the final model first (paper numbers), then the ablation reference and the ablations
+    STAGES = ['audit', 'train_main', 'eval_full', 'competitors', 'analyses_full', 'train_full', 'ablations', 'analyses_ablation',
+              'tables']
     RUN_COMPETITORS = True        # stage 'competitors': public competitor models (Competitors.py) restore the test sets
 
     # ---------------------------------------------------------------- hardware
@@ -373,14 +375,14 @@ class Config:
     # once).  main() prints the measured s/iteration and the GPU-hours left before the ablations.
     EPOCHS = 150                  # reference full model KASIRNet_full (= "full, seed 1" of every ablation table)
     ABLATION_EPOCHS = 150         # every ablation run: the same budget and recipe as KASIRNet_full
-    # Final model of Tables 4-5 (run MAIN_RUN_ID): KASIRNet_full continued by a second cosine cycle (warm
-    # restart, SGDR, Loshchilov & Hutter, ICLR 2017) of MAIN_EPOCHS epochs, i.e. 300 epochs / ~142,000 updates
-    # in total, about the budget of comparable all-in-one models (PromptIR, AdaIR) and ~4x the first G4 run
-    # (35,700 updates at 1e-4).  MAIN_INIT_FROM = None trains it from scratch (then set MAIN_EPOCHS = 300);
-    # MAIN_EPOCHS = 0 reports KASIRNet_full itself.
+    # Final model of Tables 4-5 (run MAIN_RUN_ID): 300 epochs from scratch (~131,000 updates at batch 64, about the
+    # budget of comparable all-in-one models), same recipe as below.  The ablations use a shorter but IDENTICAL budget
+    # for every variant and for their own full reference (KASIRNet_full = "full, seed 1"), as is standard (e.g. the
+    # Restormer ablations use 100k iterations): an ablation is fair when each variant is compared with a reference
+    # trained exactly like it.  ABLATION_EPOCHS = EPOCHS = 300 is possible (~60 GPU-h per run instead of ~30).
     MAIN_RUN_ID = 'KASIRNet_main'
-    MAIN_INIT_FROM = 'KASIRNet_full'
-    MAIN_EPOCHS = 150             # KASIRNet_main = KASIRNet_full + 150 epochs (warm restart) = 300 epochs in total
+    MAIN_INIT_FROM = None         # trained from scratch (set 'KASIRNet_full' for a warm restart from the reference)
+    MAIN_EPOCHS = 300             # final model: 300 epochs, one cosine cycle
     MAIN_LR = 3e-4
     MAIN_WARMUP_ITERS = 1500
     CKPT_EVERY_ITERS = 2000       # resumable checkpoint (atomic write) every N iterations
