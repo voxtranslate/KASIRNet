@@ -35,7 +35,7 @@ from Model import KASIRNet, component_parameter_table  # nb:skip
 from Loss import OmniRestorationLoss  # nb:skip
 from metrics import MetricSuite, psnr_torch  # nb:skip
 
-FAMILIES = ['blur', 'rain', 'haze', 'snow', 'noise']
+FAMILIES = ['blur', 'rain', 'haze', 'snow', 'noise', 'mixed']
 
 
 def seed_everything(seed, deterministic=False):

@@ -240,6 +240,19 @@ class Config:
         'docs':       dict(family='noise', input=('docs', 'train'), gt=('docs', 'train_cleaned'), direction='contrast_gt'),
         'alphaisp':   dict(family='noise', input=('alphaisp', 'AlphaISP - Denoising Dataset/AlphaISP - Denoising Dataset/PNG Data/2DNR Denoising/Noised'),
                            gt=('alphaisp', 'AlphaISP - Denoising Dataset/AlphaISP - Denoising Dataset/PNG Data/2DNR Denoising/Ground Truth')),
+        # ---- synthetic categories, degraded on the fly from clean training images (Datasets, section 5b)
+        # Koehler-equivalent camera shake: the image-formation model of Koehler et al. (ECCV 2012), i.e. the
+        # mean of homographies K R(t) K^-1 along a 6-DOF rotational hand-shake trajectory, integrated in linear
+        # light, non-uniform over a virtual full frame, mild sensor noise / JPEG.  Random trajectories (no
+        # Koehler image or trajectory), clean images = GoPro training sharp frames.
+        'camera_shake': dict(family='blur', synth='camera_shake',
+                             input=('dblur', 'DBlur/Gopro/train/sharp'), gt=('dblur', 'DBlur/Gopro/train/sharp')),
+        # Composite degradations: 1-3 of haze, rain streaks, snow, defocus, camera shake, low light,
+        # Poisson-Gaussian noise, JPEG, applied in physical order to the same image.
+        'composite':  dict(family='mixed', synth='composite', repeat=2,
+                           input=('reside6k', 'RESIDE-6K/train/GT'), gt=('reside6k', 'RESIDE-6K/train/GT'),
+                           exclude_overlap_with=['gopro', 'hide', 'textocr', 'kohler', 'rain100l', 'rain100h', 'reside6k',
+                                                 'snow100k_l', 'snow100k_s', 'snow100k_m', 'cbsd68_g25', 'live1_q10', 'lol', 'dpdd']),
     }
     # Koehler has no official training split.  'test_only' (default, standard protocol):
     # all 48 images are a test set and none is trained on.  'scene_split': scenes 1-3 are a
@@ -319,31 +332,30 @@ class Config:
     # ----------------------------------------------- training (Section 4.1)
     PATCH_SIZE = 256
     BATCH_SIZE = 64               # G4 (96 GB); Section 4.1 must state batch 64 (the submitted paper said 6)
-    LR = 1e-4                     # reference full model (KASIRNet_full) and every ablation run
-    WARMUP_ITERS = 0
+    # Learning rate of every run: the paper value 1e-4 was set for batch 6; at batch 64 it is scaled by the
+    # square-root rule (1e-4 x sqrt(64/6) = 3.3e-4; Malladi et al., NeurIPS 2022), with a linear warm-up
+    # (Goyal et al., 2017) because the first updates of a transformer at this rate are unstable in FP16.
+    LR = 3e-4
+    WARMUP_ITERS = 1500
     BETAS = (0.9, 0.999)
     WEIGHT_DECAY = 0.0
     ETA_MIN = 1e-7                # cosine annealing per iteration from LR to ETA_MIN over the whole budget
     GRAD_CLIP = 1.0
-    # Budget.  One epoch = one pass over the (capped, repeated) training pool, i.e.
-    # floor(N_train / BATCH_SIZE) iterations (22,871 samples -> 357 iterations at batch 64).
-    # The full model gets 100 epochs (35,700 iterations, ~2.3 M patches) and every ablation run gets
-    # exactly the same budget (ABLATION_EPOCHS = EPOCHS).  With equal budgets the ablation reference
-    # "full, seed SEED" is the full model itself: it is trained once (run KASIRNet_full) and reused,
-    # never trained a second time.  main() prints the measured s/iteration and the GPU-hours left.
-    EPOCHS = 100
-    ABLATION_EPOCHS = 100
-    # Final model of Tables 4-5 (run MAIN_RUN_ID).  At batch 64 the 100-epoch recipe makes only 35,700
-    # parameter updates at the learning rate of the batch-6 paper setting (1e-4): ~10x fewer updates than
-    # the paper and 3-8x fewer than comparable all-in-one models (PromptIR, AdaIR: 120-150 epochs).  The
-    # final model therefore continues KASIRNet_full with a second cosine cycle (warm restart, SGDR,
-    # Loshchilov & Hutter, ICLR 2017) of MAIN_EPOCHS epochs at MAIN_LR = 3e-4 (square-root scaling of the
-    # paper learning rate to batch 64: 1e-4 x sqrt(64/6) = 3.3e-4; Malladi et al., NeurIPS 2022), with a
-    # linear warm-up.  Total 300 epochs / 107,100 updates.  MAIN_INIT_FROM = None trains it from scratch
-    # (then set MAIN_EPOCHS = 300).  MAIN_EPOCHS = 0 reports KASIRNet_full itself.
+    # Budget.  One epoch = one pass over the (capped, repeated) training pool, i.e. floor(N_train / BATCH_SIZE)
+    # iterations (~30,400 samples with the two synthetic categories -> ~474 iterations at batch 64).
+    # KASIRNet_full and every ablation run: 150 epochs (~71,000 iterations), the same recipe, so every ablation
+    # is compared with a reference trained exactly like it; "full, seed SEED" is KASIRNet_full itself (trained
+    # once).  main() prints the measured s/iteration and the GPU-hours left before the ablations.
+    EPOCHS = 150                  # reference full model KASIRNet_full (= "full, seed 1" of every ablation table)
+    ABLATION_EPOCHS = 150         # every ablation run: the same budget and recipe as KASIRNet_full
+    # Final model of Tables 4-5 (run MAIN_RUN_ID): KASIRNet_full continued by a second cosine cycle (warm
+    # restart, SGDR, Loshchilov & Hutter, ICLR 2017) of MAIN_EPOCHS epochs, i.e. 300 epochs / ~142,000 updates
+    # in total, about the budget of comparable all-in-one models (PromptIR, AdaIR) and ~4x the first G4 run
+    # (35,700 updates at 1e-4).  MAIN_INIT_FROM = None trains it from scratch (then set MAIN_EPOCHS = 300);
+    # MAIN_EPOCHS = 0 reports KASIRNet_full itself.
     MAIN_RUN_ID = 'KASIRNet_main'
     MAIN_INIT_FROM = 'KASIRNet_full'
-    MAIN_EPOCHS = 200
+    MAIN_EPOCHS = 150             # KASIRNet_main = KASIRNet_full + 150 epochs (warm restart) = 300 epochs in total
     MAIN_LR = 3e-4
     MAIN_WARMUP_ITERS = 1500
     CKPT_EVERY_ITERS = 2000       # resumable checkpoint (atomic write) every N iterations

@@ -12,6 +12,7 @@
 # ==========================================================================
 import os
 import io
+import math
 import re
 import glob
 import json
@@ -23,6 +24,7 @@ import zipfile
 import time
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 from PIL import Image, ImageFile
 import torchvision.transforms.functional as TF
@@ -583,8 +585,11 @@ def build_training_manifest(cfg, roots, force=False):
         man['categories'][name] = rep
 
         def item(a, g):
-            return dict(src_in=ki, input=os.path.relpath(a, roots[ki]), src_gt=kg, gt=os.path.relpath(g, roots[kg]),
-                        category=name, family=spec['family'])
+            it = dict(src_in=ki, input=os.path.relpath(a, roots[ki]), src_gt=kg, gt=os.path.relpath(g, roots[kg]),
+                      category=name, family=spec['family'])
+            if spec.get('synth'):      # degraded on the fly from the clean image (Section 5b)
+                it['synth'] = spec['synth']
+            return it
         man['train'] += [dict(item(a, g), repeat=spec.get('repeat', 1)) for a, g, _ in train]
         man['val'] += [item(a, g) for a, g, _ in val]
         print(f'[data] {name:11s} pairs={rep["n_pairs"]:6d}  checked={pos:6d}  overlap-removed={len(removed):4d}  '
@@ -711,7 +716,18 @@ def validate_data(cfg, roots, man):
         items = [(it['input'], it['gt']) for it in man['train'] if it['category'] == name]
         if not items:
             continue
-        stats, bad = sample_stats(items)
+        if spec.get('synth'):   # check the generated pairs themselves (generator, sizes, direction)
+            ds = UniversalRestorationDataset([dict(it, repeat=1) for it in man['train'] if it['category'] == name][:cfg.VALIDATE_SAMPLES],
+                                             cfg.PATCH_SIZE, False)
+            stats, bad = [], 0
+            for k in range(len(ds)):
+                try:
+                    b = ds[k]
+                    stats.append(_pair_stats(None, None, TF.to_pil_image(b['input']), TF.to_pil_image(b['gt'])))
+                except Exception:
+                    bad += 1
+        else:
+            stats, bad = sample_stats(items)
         cat = man['categories'][name]
         pr = cat['n_pairs'] / max(1, min(cat.get('n_input_keys', cat['n_pairs']), cat.get('n_gt_keys', cat['n_pairs'])))
         rows.append(dict(_summarise(name, spec['family'], stats, spec.get('direction', DIRECTION.get(spec['family'])), cfg,
@@ -785,6 +801,176 @@ def degrade(img_t, ops, seed, haze_depth=(0.5, 1.0)):
 
 
 # ==========================================
+# 5b. Physically based synthetic degradations for TRAINING (camera shake, composites)
+# ==========================================
+# Applied on the fly to clean training images (a new draw every epoch; validation items use a
+# fixed seed per image).  Everything is computed in linear light (sRGB gamma 2.2 removed), as a
+# sensor integrates light, then re-encoded.
+
+def _srgb_to_lin(x):
+    return x.clamp(0, 1) ** 2.2
+
+
+def _lin_to_srgb(x):
+    return x.clamp(0, 1) ** (1 / 2.2)
+
+
+def _rot(ax, ay, az):
+    cx, sx, cy, sy, cz, sz = math.cos(ax), math.sin(ax), math.cos(ay), math.sin(ay), math.cos(az), math.sin(az)
+    Rx = torch.tensor([[1, 0, 0], [0, cx, -sx], [0, sx, cx]], dtype=torch.float32)
+    Ry = torch.tensor([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]], dtype=torch.float32)
+    Rz = torch.tensor([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]], dtype=torch.float32)
+    return Rz @ Ry @ Rx
+
+
+def shake_trajectory(rng, n=48, extent_px=20.0, focal=1000.0, roll_ratio=0.3):
+    """6-DOF hand-shake model, rotations only (translations are negligible for scenes farther than
+    ~1 m, as in Koehler et al., ECCV 2012).  Angular velocity is a random walk with inertia plus rare
+    impulsive jerks (Boracchi & Foi, TIP 2012, extended to 3 axes).  The path is centred on its mean pose
+    (the sharp reference is the mean pose) and scaled so that the image-centre blur extent is `extent_px`."""
+    w = np.zeros(3)
+    ang = np.zeros((n, 3))
+    for t in range(1, n):
+        jerk = rng.normal(0, 1.0, 3) * (rng.random() < 0.08) * 3.0
+        w = 0.75 * w + rng.normal(0, 1.0, 3) + jerk
+        ang[t] = ang[t - 1] + w
+    ang -= ang.mean(0)
+    span = np.ptp(ang[:, :2], axis=0).max() + 1e-9
+    ang[:, :2] *= (extent_px / focal) / span          # pitch / yaw: displacement ~ focal * angle
+    ang[:, 2] *= roll_ratio * (extent_px / focal) / (np.ptp(ang[:, 2]) + 1e-9) * rng.random()
+    return ang
+
+
+def camera_shake(clean_lin, rng, out=256, extent_px=None, frame=None):
+    """clean_lin: (3, S, S) linear-light patch with S = out + 2 m.  Returns the (3, out, out) blurred
+    linear patch = mean over the trajectory of the patch warped by H_t = K R_t K^-1, the patch being at
+    a random position of a virtual full frame (spatially varying blur, strongest away from the centre
+    for the roll component)."""
+    S = clean_lin.shape[-1]
+    m = (S - out) // 2
+    extent_px = extent_px if extent_px is not None else float(rng.uniform(4, 40))
+    Wf = frame or float(rng.uniform(800, 1600))
+    focal = Wf * float(rng.uniform(0.8, 1.4))
+    ox, oy = rng.uniform(-Wf / 2, Wf / 2 - out), rng.uniform(-Wf / 2.6, Wf / 2.6 - out)   # top-left of the patch in centred frame coords
+    ang = shake_trajectory(rng, n=int(rng.integers(24, 64)), extent_px=extent_px, focal=focal)
+    ys, xs = torch.meshgrid(torch.arange(out, dtype=torch.float32), torch.arange(out, dtype=torch.float32), indexing='ij')
+    P = torch.stack([xs + ox, ys + oy, torch.full_like(xs, focal)], 0).view(3, -1)    # rays of the output pixels
+    grids = []
+    for a in ang:
+        q = _rot(*a) @ P
+        u = focal * q[0] / q[2] - ox + m        # source pixel in the margin-padded patch
+        v = focal * q[1] / q[2] - oy + m
+        grids.append(torch.stack([u / (S - 1) * 2 - 1, v / (S - 1) * 2 - 1], -1).view(out, out, 2))
+    grid = torch.stack(grids)
+    src = clean_lin.unsqueeze(0).expand(len(grids), -1, -1, -1)
+    warped = F.grid_sample(src, grid, mode='bilinear', padding_mode='reflection', align_corners=True)
+    return warped.mean(0)
+
+
+def _disk(r):
+    k = int(math.ceil(r))
+    y, x = torch.meshgrid(torch.arange(-k, k + 1, dtype=torch.float32), torch.arange(-k, k + 1, dtype=torch.float32), indexing='ij')
+    d = (r + 0.5 - torch.sqrt(x ** 2 + y ** 2)).clamp(0, 1)
+    return d / d.sum()
+
+
+def _line(length, angle_deg):
+    k = int(math.ceil(length / 2)) + 1
+    ker = torch.zeros(2 * k + 1, 2 * k + 1)
+    a = math.radians(angle_deg)
+    for t in np.linspace(-length / 2, length / 2, int(length * 3) + 1):
+        ker[int(round(k + t * math.sin(a))), int(round(k + t * math.cos(a)))] += 1
+    return ker / ker.sum()
+
+
+def _conv(x, ker):
+    k = ker.shape[-1] // 2
+    return F.conv2d(F.pad(x.unsqueeze(0), (k, k, k, k), mode='reflect'), ker.view(1, 1, *ker.shape).repeat(x.shape[0], 1, 1, 1),
+                    groups=x.shape[0])[0]
+
+
+def _smooth_field(rng, H, W, cells=4):
+    f = torch.from_numpy(rng.random((1, 1, cells, cells)).astype(np.float32))
+    return F.interpolate(f, size=(H, W), mode='bicubic', align_corners=False)[0, 0].clamp(0, 1)
+
+
+def _gen(rng):
+    return torch.Generator().manual_seed(int(rng.integers(0, 2 ** 31 - 1)))
+
+
+SYNTH_TYPES = ('haze', 'rain', 'snow', 'defocus', 'shake', 'lowlight', 'noise', 'jpeg')
+_SYNTH_ORDER = {t: i for i, t in enumerate(SYNTH_TYPES)}    # physical order: scene -> optics -> exposure -> sensor -> codec
+
+
+def synth_degrade(clean, kind, rng, out=256, types=SYNTH_TYPES):
+    """clean: (3, S, S) sRGB patch, S = out + 2 * SYNTH_MARGIN.  kind 'camera_shake': camera-shake blur +
+    sensor noise (+ JPEG); kind 'composite': 1-3 degradations of `types` in physical order.
+    Returns (degraded, gt), both (3, out, out) in [0, 1]."""
+    S = clean.shape[-1]
+    m = (S - out) // 2
+    gt = clean[:, m:m + out, m:m + out]
+    g = _gen(rng)
+    if kind == 'camera_shake':
+        ops = ['shake', 'noise'] + (['jpeg'] if rng.random() < 0.5 else [])      # Koehler-like: low ISO, mild noise
+        params = dict(noise=float(rng.uniform(0.0, 0.006)), jpeg=int(rng.integers(75, 96)))
+    else:
+        pool = [t for t in types]
+        k = int(rng.choice([1, 2, 3], p=[0.25, 0.45, 0.30]))
+        ops = []
+        while len(ops) < k and pool:
+            t = pool.pop(int(rng.integers(len(pool))))
+            if (t == 'defocus' and 'shake' in ops) or (t == 'shake' and 'defocus' in ops):
+                continue
+            ops.append(t)
+        ops.sort(key=_SYNTH_ORDER.get)
+        params = dict(noise=float(rng.uniform(0.01, 0.12)), jpeg=int(rng.integers(10, 60)))
+    x = _srgb_to_lin(clean)
+    for op in ops:
+        if op == 'haze':      # ASM with a smooth random depth field: I = J t + A (1 - t)
+            d = 0.4 + 0.6 * _smooth_field(rng, S, S)
+            t = torch.exp(-float(rng.uniform(0.6, 2.5)) * d)
+            A = float(rng.uniform(0.6, 1.0))
+            x = x * t + _srgb_to_lin(torch.tensor(A)) * (1 - t)
+        elif op == 'rain':    # sparse drops motion-blurred into streaks, added to the scene
+            dens = float(rng.uniform(0.002, 0.012))
+            seeds = (torch.rand((1, S, S), generator=g) < dens).float() * torch.rand((1, S, S), generator=g)
+            streak = _conv(seeds, _line(float(rng.uniform(10, 45)), float(90 + rng.uniform(-30, 30))))
+            streak = (streak / (streak.max() + 1e-6)) * float(rng.uniform(0.4, 0.9))
+            x = 1 - (1 - x) * (1 - streak)            # screen blend
+        elif op == 'snow':    # opaque flakes of several sizes, slightly motion-blurred
+            layer = torch.zeros(1, S, S)
+            for r, dens in ((1.0, 0.004), (2.0, 0.0015), (3.5, 0.0005)):
+                pts = (torch.rand((1, S, S), generator=g) < dens * float(rng.uniform(0.5, 2))).float()
+                layer = torch.maximum(layer, _conv(pts, _disk(r)) * (2 * r + 1) ** 2 * 0.6)
+            layer = _conv(layer.clamp(0, 1), _line(float(rng.uniform(1, 6)), float(rng.uniform(60, 120))))
+            x = x * (1 - layer) + layer * float(rng.uniform(0.8, 1.0))
+        elif op == 'defocus':
+            x = _conv(x, _disk(float(rng.uniform(1.5, 8))))
+        elif op == 'shake':   # whole S x S patch (the outer margin absorbs the border of the warps)
+            x = camera_shake(F.pad(x.unsqueeze(0), (16, 16, 16, 16), mode='reflect')[0], rng, out=S,
+                             extent_px=float(rng.uniform(4, 40)))
+        elif op == 'lowlight':
+            x = x * float(rng.uniform(0.02, 0.25))
+            params['noise'] = max(params['noise'], float(rng.uniform(0.01, 0.05)))
+            if 'noise' not in ops:
+                ops.append('noise')
+        elif op == 'noise':   # Poisson-Gaussian sensor noise in linear light
+            a, b = params['noise'] * float(rng.uniform(0.2, 1.0)), params['noise']
+            x = x + torch.sqrt(a * x.clamp(min=0) + b ** 2) * torch.randn(x.shape, generator=g)
+        elif op == 'jpeg':
+            pass                # applied after re-encoding to sRGB
+    y = _lin_to_srgb(x)[:, m:m + out, m:m + out]
+    if 'jpeg' in ops:
+        buf = io.BytesIO()
+        TF.to_pil_image(y.clamp(0, 1)).save(buf, format='JPEG', quality=params['jpeg'])
+        y = TF.to_tensor(Image.open(io.BytesIO(buf.getvalue())).convert('RGB'))
+    return y.clamp(0, 1), gt
+
+
+SYNTH_MARGIN = 48   # clean patches are cropped with this margin so that blur kernels never see a border
+
+
+# ==========================================
 # 6. Datasets
 # ==========================================
 
@@ -836,9 +1022,35 @@ class UniversalRestorationDataset(Dataset):
             gt = gt.crop((left, top, left + p, top + p))
         return TF.to_tensor(image), TF.to_tensor(gt)
 
+    def synth_item(self, item):
+        """Clean patch with a margin -> on-the-fly degradation (random every epoch; fixed seed for validation)."""
+        img = load_rgb(item['gt'])
+        S = self.patch_size + 2 * SYNTH_MARGIN
+        w, h = img.size
+        if w < S or h < S:
+            sc = S / min(w, h)
+            img = img.resize((max(S, round(w * sc)), max(S, round(h * sc))), Image.BICUBIC)
+            w, h = img.size
+        if self.is_train:
+            left, top = random.randint(0, w - S), random.randint(0, h - S)
+            rng = np.random.default_rng(random.getrandbits(62))
+        else:
+            left, top = (w - S) // 2, (h - S) // 2
+            rng = np.random.default_rng(image_seed(Config.SYNTHETIC_SEED, item['gt']))
+        c = TF.to_tensor(img.crop((left, top, left + S, top + S)))
+        if self.is_train:
+            if random.random() > 0.5:
+                c = torch.flip(c, dims=[2])
+            if random.random() > 0.5:
+                c = torch.flip(c, dims=[1])
+        return synth_degrade(c, item['synth'], rng, out=self.patch_size)
+
     def __getitem__(self, idx):
         item = self.samples[idx]
-        inp, gt = self.transform(load_rgb(item['input']), load_rgb(item['gt']))
+        if item.get('synth'):
+            inp, gt = self.synth_item(item)
+        else:
+            inp, gt = self.transform(load_rgb(item['input']), load_rgb(item['gt']))
         return {'input': inp, 'gt': gt, 'task_id': self.task_to_id[item['category']],
                 'family_id': self.family_to_id[item['family']]}
 

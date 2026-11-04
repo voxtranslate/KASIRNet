@@ -22,16 +22,21 @@ Each code cell below is **identical** to the module of the same name in the repo
 | stage | what it does | main outputs (under `OUTPUT_ROOT`) |
 |---|---|---|
 | `audit` | restores the datasets from the Google-Drive cache (or downloads them once and caches them), builds the frozen training manifest with the train/test leakage audit, validates every category and benchmark (pairing, alignment, direction, sizes), writes the Step-0 facts (metric definition, SSIM-loss gradient, SRB gate initialisation, submitted checkpoint, data pairing) | `datasets_cache/*.tar`, `data_manifest/{train_manifest,data_validation}.json`, `analysis/step0_facts/` |
-| `train_full` | full KASIRNet (batch 64, Adam 1e-4, cosine, clip 1.0, FP16, six loss weights 5/0.5/1/1/1/0.5), `EPOCHS` = 100 = 35,700 iterations | `checkpoints/KASIRNet_full/final.pth`, `runs/KASIRNet_full/{run.json, curves.png, history_*.csv}` |
-| `eval_full` | 8 benchmarks + Rain100H + Snow100K-S/M + Gaussian σ15/25/50 + LIVE1/LOL/DPDD at full resolution | `runs/KASIRNet_full/eval/<bench>/per_image.csv` (PSNR, SSIM, LPIPS, DISTS), `summary.json` |
+| `train_full` | reference KASIRNet (batch 64, Adam 3e-4 with 1,500-iteration warm-up, cosine, clip 1.0, FP16, six loss terms), `EPOCHS` = 150; also the "full, seed 1" reference of every ablation table | `checkpoints/KASIRNet_full/final.pth`, `runs/KASIRNet_full/{run.json, curves.png, history_*.csv}` |
+| `train_main` | final model of Tables 4–5: `KASIRNet_full` + `MAIN_EPOCHS` = 150 (warm restart), 300 epochs in total | `checkpoints/KASIRNet_main/final.pth`, `runs/KASIRNet_main/` |
+| `eval_full` | inference protocol chosen once on the held-out validation pairs (`full` / train-consistent `tiled256` / `tiled384`), then 8 benchmarks + Rain100H + Snow100K-S/M + Gaussian σ15/25/50 + LIVE1/LOL/DPDD (Köhler registered to its reference) | `analysis/inference_protocol/`, `runs/KASIRNet_main/eval/<bench>/per_image.csv` (PSNR, SSIM, LPIPS, DISTS), `summary.json` |
 | `analyses_full` | cost (TODO-13), bootstrap CI + Wilcoxon (TODO-12C), LPIPS/DISTS + divergent % (TODO-14), prompt probe + mixed sets (TODO-16), spectral/phase analysis, feature stability, Figs. S1/S2 (TODO-06), explainability | `tables/`, `analysis/` |
-| `ablations` | 45 runs with the same 100 epochs as the full model (`ABLATION_EPOCHS = EPOCHS`; the seed-1 full reference is the full model itself, trained once): TODO-12A (5 variants × 3 seeds), TODO-09B (extractors), TODO-12B (interactions), TODO-15 (loss weights ×0.5/×2), Table 6 rows, Table 7 rows, SCWAM design | `runs/<run_id>/run.json` + GoPro/Rain100L/SIDD per-image CSVs |
+| `ablations` | 45 runs with the same 150 epochs and recipe as `KASIRNet_full` (which is their seed-1 full reference, trained once): TODO-12A (5 variants × 3 seeds), TODO-09B (extractors), TODO-12B (interactions), TODO-15 (loss weights ×0.5/×2), Table 6 rows, Table 7 rows, SCWAM design | `runs/<run_id>/run.json` + GoPro/Rain100L/SIDD per-image CSVs |
 | `analyses_ablation` | SIM vs severity (TODO-09A) and all ablation tables | `tables/table6…`, `table7…`, `table8…`, `table9…`, `table12…` |
 | `tables` | Tables 4/5, Rain100H (TODO-02), zero-shot (TODO-17), Section 4.1 reproducibility summary | `tables/*.csv`, `tables/*.tex` |
 
 **Parallel sessions.** If more than one G4 session is available, open this notebook in each of them (same Google account / Drive) and *Run all*: a run being trained holds a lock with a heartbeat, so the sessions share the ablation queue without training the same run twice (`Config.LOCK_STALE_MINUTES`). The measured s/iteration and the GPU-hours left are printed at the start of the `ablations` stage.
 
 Competitor outputs that the authors hold (HIDE Restormer, TextOCR CNN-ViT, Köhler Rahman et al., RESIDE-6K ADSM, SIDD Defusion; Rain100L / Snow100K-L methods for Figs. S1/S2) are read from `Config.COMPETITOR_ROOT` and scored with the same metric function.
+"""
+
+MOUNT = """from google.colab import drive
+drive.mount('/content/drive')
 """
 
 SETUP = """# ---- environment (Colab G4).  pyiqa is pinned to the version that produced the submitted figures.
@@ -75,7 +80,7 @@ def cell(kind, src):
 
 
 def build(path=os.path.join(ROOT, 'KASIRNet.ipynb')):
-    cells = [cell('markdown', INTRO), cell('code', SETUP)]
+    cells = [cell('markdown', INTRO), cell('code', MOUNT), cell('code', SETUP)]
     for m in MODULES:
         cells.append(cell('code', module_source(m).replace("\nif __name__ == '__main__':\n    main()", '')))
     cells.append(cell('code', RUN))
