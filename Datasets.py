@@ -374,6 +374,14 @@ def level_names(cfg_names, level):
 
 
 def spec_pairs(spec, roots):
+    if spec.get('synth'):    # synthetic category: the clean images only (degraded on the fly)
+        d = resolve_path(roots, spec['gt'])
+        files = list_images(d)
+        if not files:
+            raise FileNotFoundError(f'no clean images in {d}')
+        pairs = [(f, f, os.path.splitext(os.path.basename(f))[0]) for f in files]
+        return pairs, dict(input_dir=d, gt_dir=d, n_input_files=len(files), n_gt_files=len(files), n_input_keys=len(files),
+                           n_gt_keys=len(files), n_pairs=len(pairs), n_unmatched=0, synthetic=spec['synth'])
     if 'root' in spec:
         return pair_by_replace(resolve_path(roots, spec['root']), spec['input_glob'], spec['gt_replace'])
     pairs, rep = pair_files(resolve_path(roots, spec['input']), resolve_path(roots, spec['gt']),
@@ -730,8 +738,12 @@ def validate_data(cfg, roots, man):
             stats, bad = sample_stats(items)
         cat = man['categories'][name]
         pr = cat['n_pairs'] / max(1, min(cat.get('n_input_keys', cat['n_pairs']), cat.get('n_gt_keys', cat['n_pairs'])))
-        rows.append(dict(_summarise(name, spec['family'], stats, spec.get('direction', DIRECTION.get(spec['family'])), cfg,
-                                    dict(n_unreadable=bad, pair_rate=pr)), kind='train'))
+        r = dict(_summarise(name, spec['family'], stats, spec.get('direction', DIRECTION.get(spec['family'])), cfg,
+                            dict(n_unreadable=bad, pair_rate=pr)), kind='train')
+        if spec.get('synth'):   # pairs correct by construction: pairing / direction statistics are informative only
+            r['flags'] = [f for f in r['flags'] if f not in ('MISPAIR', 'SWAP?')]
+            r['synthetic'] = spec['synth']
+        rows.append(r)
     for name, spec in cfg.benchmarks().items():
         if 'base' in spec or 'clean' in spec:
             continue
