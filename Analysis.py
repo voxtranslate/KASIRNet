@@ -1037,7 +1037,8 @@ def zero_shot_report(cfg, evaluator, run_id):
         r.update(ssim=float(np.mean([x['ssim'] for x in ours])),
                  **{k: float(np.mean([x[k] for x in ours])) for k in ('lpips', 'dists') if k in ours[0]})
         rows.append(r)
-        for method, folder in cfg.ZERO_SHOT_COMPETITORS.get(b, {}).items():
+        for method, sub in cfg.ZERO_SHOT_COMPETITORS.get(b, {}).items():
+            folder = os.path.join(cfg.COMPETITOR_ROOT, b, sub)
             path = os.path.join(cfg.analysis_dir('competitors'), b, method.replace(' ', '_').replace('/', '-') + '.csv')
             comp = evaluator.score_folder(b, method, folder, path) if evaluator is not None else read_rows(path)
             pairs = join_by_key(ours, comp)

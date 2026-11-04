@@ -988,28 +988,24 @@ class KASIRNetInferencer:
         scales, shifts = {}, {}
         for k_sc, k_sh in zip(sft_scale_keys, sft_shift_keys):
             name = k_sc.replace('sft_scale/', '')
-            scales[name] = self._acts[k_sc].mean(dim=1).squeeze().cpu().numpy()
-            shifts[name] = self._acts[k_sh].mean(dim=1).squeeze().cpu().numpy()
+            # gamma(p), beta(p) are channel-wise and spatially constant (SFT on the 256-D descriptor): one value per channel
+            scales[name] = self._acts[k_sc][0].reshape(self._acts[k_sc].shape[1], -1).mean(1).cpu().numpy()
+            shifts[name] = self._acts[k_sh][0].reshape(self._acts[k_sh].shape[1], -1).mean(1).cpu().numpy()
 
         self._remove_hooks()
         if not scales: return
 
         n = len(scales)
-        fig, axes = plt.subplots(2, n, figsize=(4 * n, 8))
+        fig, axes = plt.subplots(2, n, figsize=(4 * n, 6))
         if n == 1: axes = axes[:, None]
         for i, name in enumerate(scales.keys()):
-            sc_map, sh_map = scales[name], shifts[name]
-            im1 = axes[0, i].imshow(sc_map, cmap='coolwarm'); axes[0, i].set_title(f"SFT Scale: {name}", fontsize=10); axes[0, i].axis('off')
-            plt.colorbar(im1, ax=axes[0, i], fraction=0.046)
-            im2 = axes[1, i].imshow(sh_map, cmap='viridis'); axes[1, i].set_title(f"SFT Shift: {name}", fontsize=10); axes[1, i].axis('off')
-            plt.colorbar(im2, ax=axes[1, i], fraction=0.046)
-
+            axes[0, i].bar(range(len(scales[name])), scales[name], width=1.0, color='tab:red')
+            axes[0, i].set_title(f"SFT gamma(p): {name}", fontsize=10); axes[0, i].set_xlabel('channel')
+            axes[1, i].bar(range(len(shifts[name])), shifts[name], width=1.0, color='tab:blue')
+            axes[1, i].set_title(f"SFT beta(p): {name}", fontsize=10); axes[1, i].set_xlabel('channel')
         fig.tight_layout(); plt.savefig(save_path, bbox_inches='tight', dpi=130); plt.close(fig)
-
-        base_dir, stem = os.path.dirname(save_path), Path(save_path).stem
-        for name in scales.keys():
-            self._save_single_img(scales[name], os.path.join(base_dir, f"{stem}_{name}_sft_scale.png"), cmap='coolwarm')
-            self._save_single_img(shifts[name], os.path.join(base_dir, f"{stem}_{name}_sft_shift.png"), cmap='viridis')
+        np.savez(os.path.splitext(save_path)[0] + '_sft.npz', **{f'{k}_gamma': v for k, v in scales.items()},
+                 **{f'{k}_beta': v for k, v in shifts.items()})
 
     # ------------------------------------------------------------------
     # Global Reports
