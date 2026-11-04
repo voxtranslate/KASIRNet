@@ -16,6 +16,7 @@ from Datasets import (resolve_sources, spec_sources, build_training_manifest, Be
 from Trainer import Trainer, read_json, write_json, try_lock, release_lock  # nb:skip
 from Inferencer import Evaluator, KASIRNetInferencer, select_inference_protocol  # nb:skip
 from metrics import MetricSuite  # nb:skip
+from Competitors import competitor_plan, competitor_folders, generate_competitor_outputs  # nb:skip
 from Analysis import (step0_audit, cost_report, significance_report, prompt_probe_report, severity_report,  # nb:skip
                       feature_stability_report, spectral_report, qualitative_figures, ablation_tables,  # nb:skip
                       main_tables, section41_report, srb_consistency_report, protocol_effect_report, zero_shot_report,  # nb:skip
@@ -291,11 +292,42 @@ class Experiment:
         benches = self.cfg.MAIN_BENCHMARKS + [b for b in self.cfg.EXTRA_BENCHMARKS if not b.startswith('mix_')]
         self.evaluate_many(rid, benches, save=True)
 
+    def stage_competitors(self):
+        """Public competitor models with their official weights restore every test set they apply to
+        (COMPETITOR_ROOT/<benchmark>/<method>/, resumable); scored later with the same metric function."""
+        cfg = self.cfg
+        if not cfg.RUN_COMPETITORS:
+            return
+        for method, bench in competitor_plan(cfg):
+            try:
+                self.bench_roots([bench])
+                generate_competitor_outputs(cfg, self._roots, method, bench, self.device)
+            except Exception as e:
+                print(f'[competitors] {method} on {bench} skipped: {e}')
+            self.free()
+        self.merge_competitors()
+
+    def merge_competitors(self):
+        """Generated competitor folders join the ones held by the authors (significance tests, perceptual
+        table, Figs. S1/S2: up to 3 methods with outputs)."""
+        cfg = self.cfg
+        for b, methods in competitor_folders(cfg).items():
+            for m, folder in methods.items():
+                if os.path.isdir(folder):
+                    cfg.COMPETITOR_OUTPUTS.setdefault(b, {}).setdefault(m, folder)
+        for b in list(cfg.FIGURE_COMPETITORS):
+            have = {m: f for m, f in cfg.FIGURE_COMPETITORS[b].items() if os.path.isdir(f)}
+            for m, f in cfg.COMPETITOR_OUTPUTS.get(b, {}).items():
+                if len(have) < 3 and os.path.isdir(f):
+                    have.setdefault(m, f)
+            cfg.FIGURE_COMPETITORS[b] = have
+
     def stage_analyses_full(self):
         cfg, rid = self.cfg, self.cfg.report_run_id()
         if not self.complete(rid):
             print(f'[analyses_full] {rid} not trained yet'); return
         self.bench_roots(cfg.MAIN_BENCHMARKS + cfg.EXTRA_BENCHMARKS)
+        self.merge_competitors()
         ev = self.evaluator()
         steps = dict(
             cost=lambda: cost_report(cfg, cfg.all_runs()[rid], self.device),

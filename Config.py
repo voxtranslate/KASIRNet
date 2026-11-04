@@ -16,7 +16,8 @@ class Config:
     # main() executes these stages in order; each one is idempotent (a finished run
     # or analysis is detected from its JSON and skipped), so the notebook can be
     # re-run in as many Colab sessions as needed.
-    STAGES = ['audit', 'train_full', 'train_main', 'eval_full', 'analyses_full', 'ablations', 'analyses_ablation', 'tables']
+    STAGES = ['audit', 'train_full', 'train_main', 'eval_full', 'competitors', 'analyses_full', 'ablations', 'analyses_ablation', 'tables']
+    RUN_COMPETITORS = True        # stage 'competitors': public competitor models (Competitors.py) restore the test sets
 
     # ---------------------------------------------------------------- hardware
     # Colab "G4" runtime = NVIDIA RTX PRO 6000 Blackwell Server Edition (96 GB).
@@ -87,7 +88,9 @@ class Config:
     ZERO_SHOT_BENCHMARKS = ['live1_q10', 'lol', 'dpdd']
     ZERO_SHOT_COMPETITORS = {'live1_q10': {'PromptIR (noise/rain/haze)': f'{COMPETITOR_ROOT}/live1_q10/PromptIR'},
                              'lol':       {'PromptIR (noise/rain/haze)': f'{COMPETITOR_ROOT}/lol/PromptIR'},
-                             'dpdd':      {'PromptIR (noise/rain/haze)': f'{COMPETITOR_ROOT}/dpdd/PromptIR'}}
+                             'dpdd':      {'PromptIR (noise/rain/haze)': f'{COMPETITOR_ROOT}/dpdd/PromptIR',
+                                           # trained ON DPDD: a specialist upper reference, not a zero-shot method
+                                           'Restormer (trained on DPDD, reference)': f'{COMPETITOR_ROOT}/dpdd/Restormer'}}
     ZERO_SHOT_CHANGE_DB = 0.1     # |delta PSNR| below this counts as "unchanged" for an image
     FIGURE_COMPETITORS = {          # supplementary Figs. S1/S2 (TODO-06): up to 3 methods each
         'rain100l':   {'PromptIR': f'{COMPETITOR_ROOT}/rain100l/PromptIR', 'AdaIR': f'{COMPETITOR_ROOT}/rain100l/AdaIR',
@@ -421,6 +424,8 @@ class Config:
             setattr(self, k, copy.deepcopy(v))
         self.MODEL = copy.deepcopy(self.MODEL)
         self.LOSS_WEIGHTS = copy.deepcopy(self.LOSS_WEIGHTS)
+        self.COMPETITOR_OUTPUTS = copy.deepcopy(self.COMPETITOR_OUTPUTS)     # extended by main.merge_competitors()
+        self.FIGURE_COMPETITORS = copy.deepcopy(self.FIGURE_COMPETITORS)
 
     def report_run_id(self):
         """The model reported in Tables 4-5 and analysed (final model if configured, else KASIRNet_full)."""

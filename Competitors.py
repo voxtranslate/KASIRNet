@@ -664,6 +664,10 @@ def _cmp_task(bench):
         return 'defocus'
     if bench == 'mix_rain100l_haze':
         return 'rain+haze'
+    if bench == 'live1_q10':
+        return 'jpeg'
+    if bench == 'lol':
+        return 'lowlight'
     raise KeyError(f'no competitor task for benchmark {bench!r}')
 
 
@@ -681,7 +685,9 @@ def _cmp_weights_key(method, bench):
     task = _cmp_task(bench)
     table = {'Restormer': _RESTORMER_TASKS, 'MPRNet': _MPRNET_TASKS, 'NAFNet': _NAFNET_TASKS,
              'PromptIR': {'rain': ('promptir_3task',), 'haze': ('promptir_3task',), 'gauss_noise': ('promptir_3task',),
-                          'rain+haze': ('promptir_3task',)},
+                          'rain+haze': ('promptir_3task',),
+                          # TODO-17: PromptIR never saw JPEG, low light or defocus either -> zero-shot all-in-one reference
+                          'jpeg': ('promptir_3task',), 'lowlight': ('promptir_3task',), 'defocus': ('promptir_3task',)},
              'Histoformer': {'snow': ('histoformer_allweather',)}}[method]
     if task not in table:
         raise KeyError(f'{method} has no official weights for {bench!r} (task {task})')
@@ -745,7 +751,8 @@ COMPETITOR_MODELS = {
                    source='NAFNet-GoPro-width64.pth (huggingface.co/nyanko7/nafnet-models), NAFNet-SIDD-width64.pth '
                           '(huggingface.co/spaces/chuxiaojie/NAFNet); arch: megvii-research/NAFNet (vendored)',
                    paper='Chen et al., ECCV 2022'),
-    'PromptIR': dict(benchmarks=_RAIN + ['reside6k'] + _GAUSS + ['mix_rain100l_haze'], build=build_promptir, pad=16,
+    'PromptIR': dict(benchmarks=_RAIN + ['reside6k'] + _GAUSS + ['mix_rain100l_haze', 'live1_q10', 'lol', 'dpdd'],
+                     build=build_promptir, pad=16,
                      source='huggingface.co/deepinv/promptir promptir.ckpt (official all-in-one noise/rain/haze model); '
                             'arch: deepinv.models.PromptIR',
                      paper='Potlapalli et al., NeurIPS 2023'),

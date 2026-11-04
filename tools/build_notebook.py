@@ -8,7 +8,8 @@ import json
 import os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODULES = ['Config.py', 'metrics.py', 'Model.py', 'Loss.py', 'Datasets.py', 'Trainer.py', 'Inferencer.py', 'Analysis.py', 'main.py']
+MODULES = ['Config.py', 'metrics.py', 'Model.py', 'Loss.py', 'Datasets.py', 'Trainer.py', 'Inferencer.py', 'Analysis.py',
+           'Competitors.py', 'main.py']
 
 INTRO = """# KASIRNet — revision notebook (Information Sciences, INS-D-26-12219)
 
@@ -42,7 +43,7 @@ drive.mount('/content/drive')
 SETUP = """# ---- environment (Colab G4).  pyiqa is pinned to the version that produced the submitted figures.
 import importlib, subprocess, sys
 subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'pyiqa==0.1.16', '--no-deps'], check=False)
-subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'lmdb', 'gdown', 'kagglehub'], check=False)
+subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'lmdb', 'gdown', 'kagglehub', 'deepinv==0.5.0'], check=False)
 PIP_NAME = {'cv2': 'opencv-python-headless', 'yaml': 'pyyaml', 'skimage': 'scikit-image', 'sklearn': 'scikit-learn',
             'clip': 'openai-clip', 'PIL': 'pillow'}
 for _ in range(10):  # install any import-time dependency of pyiqa missing from the runtime
