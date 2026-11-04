@@ -170,18 +170,27 @@ class Trainer:
         self.use_amp = bool(cfg.AMP and self.device.type == 'cuda')
         self.criterion = OmniRestorationLoss(cfg.loss_weights(run), amp=self.use_amp, amp_dtype=self.amp_dtype).to(self.device)
         params = [p for p in self.model.parameters() if p.requires_grad]
-        self.optimizer = torch.optim.Adam(params, lr=cfg.LR, betas=tuple(cfg.BETAS), weight_decay=cfg.WEIGHT_DECAY)
-        floor = cfg.ETA_MIN / cfg.LR
-        T = max(1, self.total_iters)
-        self.scheduler = torch.optim.lr_scheduler.LambdaLR(
-            self.optimizer, lambda it: floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * min(it, T) / T)))
+        self.lr = float(run.get('lr', cfg.LR))
+        self.warmup = int(run.get('warmup', cfg.WARMUP_ITERS))
+        self.optimizer = torch.optim.Adam(params, lr=self.lr, betas=tuple(cfg.BETAS), weight_decay=cfg.WEIGHT_DECAY)
+        floor = cfg.ETA_MIN / self.lr
+        T, W = max(1, self.total_iters), min(self.warmup, max(0, self.total_iters - 1))
+
+        def lr_factor(it):   # linear warm-up over W iterations, then cosine from lr to ETA_MIN over the rest
+            if it < W:
+                return (it + 1) / W
+            return floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * min(it - W, T - W) / max(1, T - W)))
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_factor)
         self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp and self.amp_dtype == torch.float16)
         self.metrics = MetricSuite(self.device, ('psnr', 'ssim'))
 
         self.iteration, self.best_val, self.best_iter, self.train_seconds = 0, -1.0, 0, 0.0
         self.history = dict(train=[], val=[])
         self.skipped_steps = 0
+        self.init_from = None
         self._resume()
+        if self.iteration == 0 and run.get('init_from'):
+            self._initialise_from(run['init_from'])
 
     # ------------------------------------------------------------------ io
     def _ckpt(self, name):
@@ -191,7 +200,8 @@ class Trainer:
         s = dict(run_id=self.run_id, iteration=self.iteration, total_iters=self.total_iters,
                  manifest_signature=self.manifest['signature'],
                  model_state_dict=self.model.state_dict(), model_flags=self.cfg.model_kwargs(self.run),
-                 loss_weights=self.cfg.loss_weights(self.run), best_val_psnr=self.best_val, best_iter=self.best_iter)
+                 loss_weights=self.cfg.loss_weights(self.run), best_val_psnr=self.best_val, best_iter=self.best_iter,
+                 init_from=self.init_from)
         if full:
             s.update(optimizer_state_dict=self.optimizer.state_dict(), scheduler_state_dict=self.scheduler.state_dict(),
                      scaler_state_dict=self.scaler.state_dict(), history=self.history, train_seconds=self.train_seconds,
@@ -225,6 +235,7 @@ class Trainer:
         self.iteration, self.best_val, self.best_iter = ck['iteration'], ck['best_val_psnr'], ck['best_iter']
         self.history, self.train_seconds = ck['history'], ck.get('train_seconds', 0.0)
         self.skipped_steps = ck.get('skipped_steps', 0)
+        self.init_from = ck.get('init_from')
         r = ck.get('rng')
         if r:
             random.setstate(r['python'])
@@ -233,6 +244,19 @@ class Trainer:
             if r.get('cuda') is not None and torch.cuda.is_available():
                 torch.cuda.set_rng_state_all([t.cpu() for t in r['cuda']])
         print(f'[{self.run_id}] resumed at iteration {self.iteration}/{self.total_iters}')
+
+    def _initialise_from(self, src_id):
+        """Warm restart: start from the selected weights of another (complete) run with the same model."""
+        path = os.path.join(self.cfg.ckpt_dir(src_id), 'final.pth')
+        if not os.path.exists(path):
+            raise FileNotFoundError(f'{self.run_id} starts from {src_id}, whose final.pth does not exist yet')
+        ck = torch.load(path, map_location=self.device, weights_only=False)
+        if ck.get('manifest_signature') not in (None, self.manifest['signature']):
+            raise RuntimeError(f'{src_id} was trained on another training pool than the current manifest')
+        self.model.load_state_dict(ck['model_state_dict'], strict=True)
+        self.init_from = dict(run_id=src_id, selected=ck.get('selected'))
+        print(f'[{self.run_id}] initialised from {src_id} ({ck.get("selected")}); warm restart at lr {self.lr:g}, '
+              f'warm-up {self.warmup} iterations')
 
     # ---------------------------------------------------------- validation
     @torch.no_grad()
@@ -296,8 +320,10 @@ class Trainer:
                    budget=dict(epochs=self.run['epochs'], iters_per_epoch=self.ipe, total_iters=self.total_iters,
                                iterations_done=self.iteration, batch_size=self.cfg.BATCH_SIZE, patch=self.cfg.PATCH_SIZE,
                                samples_seen=self.iteration * self.cfg.BATCH_SIZE),
-                   optimisation=dict(optimizer='Adam', lr=self.cfg.LR, betas=list(self.cfg.BETAS), weight_decay=self.cfg.WEIGHT_DECAY,
-                                     schedule=f'cosine per iteration, {self.cfg.LR} -> {self.cfg.ETA_MIN}', grad_clip=self.cfg.GRAD_CLIP,
+                   optimisation=dict(optimizer='Adam', lr=self.lr, betas=list(self.cfg.BETAS), weight_decay=self.cfg.WEIGHT_DECAY,
+                                     warmup_iters=self.warmup, initialised_from=self.init_from,
+                                     schedule=(f'linear warm-up {self.warmup} it, then ' if self.warmup else '') +
+                                              f'cosine per iteration, {self.lr} -> {self.cfg.ETA_MIN}', grad_clip=self.cfg.GRAD_CLIP,
                                      amp=self.use_amp, amp_dtype=str(self.amp_dtype), skipped_nonfinite_steps=self.skipped_steps),
                    model_flags=self.cfg.model_kwargs(self.run), loss_weights=self.cfg.loss_weights(self.run),
                    parameters_M=component_parameter_table(self.model),

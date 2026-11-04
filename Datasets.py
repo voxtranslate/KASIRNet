@@ -635,6 +635,7 @@ def _pair_stats(a_path, g_path, a_img=None, g_img=None):
     same = a.size == g.size
     if not same:
         g = g.resize(a.size, Image.BICUBIC)
+    mse_full = float(((np.asarray(a, np.float32) - np.asarray(g, np.float32)) ** 2).mean()) / 255. ** 2
     s = 512 / max(a.size)
     if s < 1:
         a, g = a.resize((max(1, int(a.size[0] * s)), max(1, int(a.size[1] * s))), Image.BILINEAR), \
@@ -644,7 +645,8 @@ def _pair_stats(a_path, g_path, a_img=None, g_img=None):
     hf = lambda x: float(np.abs(np.diff(x, axis=0)).mean() + np.abs(np.diff(x, axis=1)).mean())
     va, vg = LeakageAuditor._vec(Image.fromarray((A * 255).astype(np.uint8)), 64), LeakageAuditor._vec(Image.fromarray((G * 255).astype(np.uint8)), 64)
     mse = float(((np.asarray(a, np.float32) - np.asarray(g, np.float32)) ** 2).mean()) / 255. ** 2
-    return dict(same_size=same, corr=float(va @ vg), psnr=10 * np.log10(1 / (mse + 1e-10)), hf_in=hf(A), hf_gt=hf(G),
+    return dict(same_size=same, corr=float(va @ vg), psnr=10 * np.log10(1 / (mse + 1e-10)),
+                psnr_full=10 * np.log10(1 / (mse_full + 1e-10)), hf_in=hf(A), hf_gt=hf(G),
                 std_in=float(A.std()), std_gt=float(G.std()), mean_in=float(A.mean()), mean_gt=float(G.mean()))
 
 
@@ -671,8 +673,23 @@ def _summarise(name, family, stats, rule, cfg, extra=None):
         flags.append('UNREADABLE')
     if r.get('pair_rate') is not None and r['pair_rate'] < 0.9:
         flags.append('UNMATCHED')
+    # fingerprint of a known benchmark (number of pairs, mean input PSNR at full resolution): catches a
+    # source that holds another test set (e.g. Rain100H served as Rain100L: 12.1 dB instead of 25.5 dB)
+    fp = cfg.BENCHMARK_FINGERPRINTS.get(name) if extra and 'n_pairs' in extra else None
+    if fp and stats:
+        r['mean_input_psnr_full'] = float(np.mean([s['psnr_full'] for s in stats]))
+        r['fingerprint'] = dict(n_pairs=fp[0], mean_input_psnr=fp[1])
+        if r['n_pairs'] != fp[0] or abs(r['mean_input_psnr_full'] - fp[1]) > cfg.FINGERPRINT_TOL_DB:
+            flags.append('FINGERPRINT')
     r['flags'] = flags
     return r
+
+
+def validation_signature(cfg):
+    """Definitions checked by validate_data(); a change re-runs the validation."""
+    return hashlib.md5(json.dumps([cfg.train_categories(), cfg.benchmarks(), cfg.BENCHMARK_FINGERPRINTS, cfg.FINGERPRINT_TOL_DB,
+                                   [[k, getattr(cfg, 'KAGGLE_SOURCES', {}).get(k)] for k in sorted(getattr(cfg, 'KAGGLE_SOURCES', {}))]],
+                                  sort_keys=True, default=str).encode()).hexdigest()
 
 
 def validate_data(cfg, roots, man):
@@ -728,6 +745,11 @@ def validate_data(cfg, roots, man):
     fatal = [r['name'] for r in rows if r['kind'] == 'train' and set(r['flags']) & {'MISPAIR', 'SWAP?', 'UNREADABLE'}]
     if fatal and cfg.VALIDATION_STRICT:
         raise RuntimeError(f'training data failed validation: {fatal} (see data_manifest/data_validation.json)')
+    wrong = [f'{r["name"]} (n={r.get("n_pairs")}, input {r.get("mean_input_psnr_full", float("nan")):.2f} dB; expected '
+             f'n={r["fingerprint"]["n_pairs"]}, {r["fingerprint"]["mean_input_psnr"]:.2f} dB)' for r in rows if 'FINGERPRINT' in r['flags']]
+    if wrong and cfg.VALIDATION_STRICT:
+        raise RuntimeError('benchmark data do not match the known test set: ' + '; '.join(wrong) +
+                           ' (wrong source or folder; see data_manifest/data_validation.json)')
     return rows
 
 

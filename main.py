@@ -12,12 +12,69 @@ import torch
 from Config import Config  # nb:skip
 from Datasets import (resolve_sources, spec_sources, build_training_manifest, BenchmarkDataset, DatasetCache,  # nb:skip
                       manifest_is_current, overlap_benchmarks, manifest_used_files, validate_data, resolve_path,  # nb:skip
-                      benchmark_files)  # nb:skip
+                      benchmark_files, validation_signature)  # nb:skip
 from Trainer import Trainer, read_json, write_json, try_lock, release_lock  # nb:skip
-from Inferencer import Evaluator, KASIRNetInferencer  # nb:skip
+from Inferencer import Evaluator, KASIRNetInferencer, select_inference_protocol  # nb:skip
+from metrics import MetricSuite  # nb:skip
 from Analysis import (step0_audit, cost_report, significance_report, prompt_probe_report, severity_report,  # nb:skip
                       feature_stability_report, spectral_report, qualitative_figures, ablation_tables,  # nb:skip
-                      main_tables, section41_report, SEVERITY_LEVELS)  # nb:skip
+                      main_tables, section41_report, srb_consistency_report, protocol_effect_report,  # nb:skip
+                      SEVERITY_LEVELS)  # nb:skip
+
+
+WEIGHT_EXT = ('.pth', '.pt', '.ckpt', '.safetensors', '.bin', '.pkl')
+
+
+def sync_weight_cache(cfg, direction):
+    """Pretrained weights (torch hub cache: torchvision, pyiqa LPIPS/DISTS, competitor checkpoints) <->
+    Google Drive (Config.WEIGHTS_CACHE), so that later sessions do not download them again."""
+    import shutil
+    hub, drive = torch.hub.get_dir(), cfg.WEIGHTS_CACHE
+    if not drive:
+        return 0
+    src, dst = (drive, hub) if direction == 'restore' else (hub, drive)
+    n = 0
+    for dp, _, fs in os.walk(src):
+        for f in fs:
+            if not f.endswith(WEIGHT_EXT):
+                continue
+            a = os.path.join(dp, f)
+            b = os.path.join(dst, os.path.relpath(a, src))
+            if os.path.exists(b) and os.path.getsize(b) == os.path.getsize(a):
+                continue
+            try:
+                os.makedirs(os.path.dirname(b), exist_ok=True)
+                shutil.copyfile(a, b + '.tmp')
+                os.replace(b + '.tmp', b)
+                n += 1
+            except OSError as e:
+                print(f'[weights] could not copy {a}: {e}')
+    return n
+
+
+def prefetch_weights(cfg):
+    """Downloads (or restores from Drive) every pretrained network the pipeline uses, before any long
+    stage: VGG-19 (SIM, perceptual loss), ResNet-50 (identity loss, TODO-09B), ConvNeXt-T (TODO-09B),
+    AlexNet + LPIPS v0.1 and VGG-16 + DISTS (metrics).  A missing network stops the run here."""
+    import torchvision.models as tvm
+    restored = sync_weight_cache(cfg, 'restore')
+    jobs = {'VGG-19 (IMAGENET1K_V1)': lambda: tvm.vgg19(weights=tvm.VGG19_Weights.IMAGENET1K_V1),
+            'ResNet-50 (IMAGENET1K_V1)': lambda: tvm.resnet50(weights=tvm.ResNet50_Weights.IMAGENET1K_V1),
+            'ConvNeXt-T (IMAGENET1K_V1)': lambda: tvm.convnext_tiny(weights=tvm.ConvNeXt_Tiny_Weights.IMAGENET1K_V1),
+            'LPIPS-Alex + DISTS (pyiqa)': lambda: MetricSuite('cpu', ('lpips', 'dists'))}
+    failed = []
+    for name, fn in jobs.items():
+        for attempt in range(3):
+            try:
+                fn()
+                break
+            except Exception as e:
+                if attempt == 2:
+                    failed.append(f'{name}: {e}')
+    stored = sync_weight_cache(cfg, 'store')
+    print(f'[weights] pretrained networks ready ({restored} restored from Drive, {stored} newly cached in {cfg.WEIGHTS_CACHE})')
+    if failed:
+        raise RuntimeError('pretrained weights could not be downloaded:\n  ' + '\n  '.join(failed))
 
 
 def setup_environment(cfg):
@@ -36,7 +93,7 @@ class Experiment:
     def __init__(self, cfg):
         self.cfg = cfg
         self.device = torch.device(cfg.DEVICE if torch.cuda.is_available() else 'cpu')
-        self._roots, self._origin, self._manifest, self._evaluator = {}, {}, None, None
+        self._roots, self._origin, self._manifest, self._evaluator, self._protocol = {}, {}, None, None, None
         self.cache = DatasetCache(cfg)
         self.stop = False
 
@@ -113,7 +170,36 @@ class Experiment:
         if self._evaluator is None:
             self._evaluator = Evaluator(self.cfg, self._roots, self.device)
         self._evaluator.roots = self._roots
+        self._evaluator.protocol = self.protocol()
         return self._evaluator
+
+    def protocol(self):
+        """Inference protocol of every evaluation.  'auto': chosen once on the held-out validation pairs
+        with the reference full model (KASIRNet_full, trained first) and then frozen for all runs."""
+        cfg = self.cfg
+        if cfg.INFERENCE_PROTOCOL != 'auto':
+            return cfg.INFERENCE_PROTOCOL
+        if self._protocol:
+            return self._protocol
+        rid = cfg.FULL_RUN_ID
+        rec = read_json(os.path.join(cfg.run_dir(rid), 'run.json'), {})
+        out_dir = cfg.analysis_dir('inference_protocol')
+        key = [cfg.INFERENCE_CANDIDATES, list(cfg.INFERENCE_SELECT_MAX_SIZE), cfg.INFERENCE_SELECT_MIN_GAIN, rid,
+               rec.get('selection', {}).get('selected')]
+        sel = read_json(os.path.join(out_dir, 'selection.json'), {})
+        if sel.get('key') == key:
+            self._protocol = sel['selected']
+            return self._protocol
+        if rec.get('status') != 'complete':
+            return 'full'          # nothing to select with yet (no evaluation happens before KASIRNet_full exists)
+        model = Evaluator(cfg, self._roots, self.device).load_run_model(cfg.all_runs()[rid])
+        sel = select_inference_protocol(cfg, model, self.manifest()['val'], self.device, out_dir)
+        sel['key'] = key
+        write_json(sel, os.path.join(out_dir, 'selection.json'))
+        del model
+        self.free()
+        self._protocol = sel['selected']
+        return self._protocol
 
     def complete(self, run_id):
         return read_json(os.path.join(self.cfg.run_dir(run_id), 'run.json'), {}).get('status') == 'complete'
@@ -145,9 +231,10 @@ class Experiment:
 
     # ------------------------------------------------------------- stages
     def stage_audit(self):
-        """Step 0: all sources (Drive cache or download), frozen training manifest with the leakage
-        audit, validation of every training category and benchmark, Step-0 facts, Drive cache."""
+        """Step 0: pretrained weights, all sources (Drive cache or download), frozen training manifest
+        with the leakage audit, validation of every training category and benchmark, Step-0 facts, Drive cache."""
         cfg = self.cfg
+        prefetch_weights(cfg)
         keys = self.all_source_keys()
         self.cache.inventory(keys)
         self.roots(keys, need_full=not manifest_is_current(cfg))
@@ -158,8 +245,10 @@ class Experiment:
                                f'(e.g. Google-Drive "quota exceeded": run again later, or place the archive in '
                                f'{cfg.DATA_CACHE_ROOT}/archives/). Everything downloaded so far is kept.')
         man = self.manifest()
-        if not os.path.exists(os.path.join(cfg.manifest_dir, 'data_validation.json')):
-            validate_data(cfg, self._roots, man)
+        vsig = validation_signature(cfg)
+        if read_json(os.path.join(cfg.manifest_dir, 'data_validation.sig.json'), {}).get('signature') != vsig:
+            validate_data(cfg, self._roots, man)     # again whenever a benchmark or category definition changed
+            write_json(dict(signature=vsig), os.path.join(cfg.manifest_dir, 'data_validation.sig.json'))
         if not os.path.exists(os.path.join(cfg.analysis_dir('step0_facts'), 'facts.json')):
             step0_audit(cfg, self._roots, self.device)
         self.cache_sources()
@@ -184,24 +273,37 @@ class Experiment:
         if st == 'paused':
             self.stop = True
 
+    def stage_train_main(self):
+        """Final model of Tables 4-5: warm restart of KASIRNet_full (Config.MAIN_*)."""
+        cfg = self.cfg
+        if cfg.MAIN_EPOCHS <= 0:
+            return
+        if cfg.MAIN_INIT_FROM and not self.complete(cfg.MAIN_INIT_FROM):
+            print(f'[train_main] waits for {cfg.MAIN_INIT_FROM}'); return
+        st = self.train(cfg.main_run())
+        if st == 'paused':
+            self.stop = True
+
     def stage_eval_full(self):
-        rid = self.cfg.FULL_RUN_ID
+        rid = self.cfg.report_run_id()
         if not self.complete(rid):
-            print('[eval_full] full model not trained yet'); return
+            print(f'[eval_full] {rid} not trained yet'); return
         benches = self.cfg.MAIN_BENCHMARKS + [b for b in self.cfg.EXTRA_BENCHMARKS if not b.startswith('mix_')]
         self.evaluate_many(rid, benches, save=True)
 
     def stage_analyses_full(self):
-        cfg, rid = self.cfg, self.cfg.FULL_RUN_ID
+        cfg, rid = self.cfg, self.cfg.report_run_id()
         if not self.complete(rid):
-            print('[analyses_full] full model not trained yet'); return
+            print(f'[analyses_full] {rid} not trained yet'); return
         self.bench_roots(cfg.MAIN_BENCHMARKS + cfg.EXTRA_BENCHMARKS)
         ev = self.evaluator()
         steps = dict(
-            cost=lambda: cost_report(cfg, cfg.full_run(), self.device),
+            cost=lambda: cost_report(cfg, cfg.all_runs()[rid], self.device),
             significance=lambda: significance_report(cfg, ev, rid),
             probe=lambda: prompt_probe_report(cfg, self._roots, ev, self.model(rid), rid),
             spectral=lambda: spectral_report(cfg, self._roots, self.model(rid), self.device),
+            srb_consistency=lambda: srb_consistency_report(cfg, self._roots, self.model(rid), self.device),
+            protocol_effect=lambda: protocol_effect_report(cfg, ev, self.model(rid), rid),
             figures=lambda: qualitative_figures(cfg, self._roots, ev, self.model(rid), rid),
             stability=lambda: feature_stability_report(cfg, self._roots, self.device),
             explain=lambda: self.explainability(rid),
@@ -249,6 +351,8 @@ class Experiment:
                 print(f'[ablations] {len(todo)}/{len(plan)} runs left x {it} iterations x {np.median(hist):.3f} s/it '
                       f'= about {len(todo) * it * np.median(hist) / 3600:.0f} GPU-hours')
         self.bench_roots(cfg.ABLATION_BENCHMARKS)
+        if cfg.full_alias() and self.complete(cfg.FULL_RUN_ID):   # the reference "full, seed 1" of every ablation table
+            self.evaluate_many(cfg.FULL_RUN_ID, cfg.ABLATION_BENCHMARKS, metric_names=('psnr', 'ssim'))
         for run in plan:
             st = self.train(run)
             if st == 'paused':
@@ -269,7 +373,7 @@ class Experiment:
         ablation_tables(cfg)
 
     def stage_tables(self):
-        main_tables(self.cfg, self.cfg.FULL_RUN_ID)
+        main_tables(self.cfg, self.cfg.report_run_id())
         ablation_tables(self.cfg)
         section41_report(self.cfg)
         print(f'[tables] all tables in {self.cfg.tables_dir}')

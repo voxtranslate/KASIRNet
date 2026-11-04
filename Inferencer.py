@@ -13,10 +13,14 @@
 import os
 import csv
 import glob
+import json
+import math
 import time
+import hashlib
 from pathlib import Path
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from torch.utils.data import DataLoader
 from PIL import Image
@@ -25,7 +29,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from Datasets import BenchmarkDataset, collate_single, IMG_EXT  # nb:skip
+from Datasets import BenchmarkDataset, collate_single, IMG_EXT, spec_sources  # nb:skip
 from Model import SpectralResonanceBlock, SemanticInjection, SFTLayer  # nb:skip
 from metrics import MetricSuite  # nb:skip
 from Trainer import build_model, load_weights, read_json, write_json  # nb:skip
@@ -71,6 +75,197 @@ def read_rows(path):
     return rows
 
 
+# ==========================================================================
+# Inference protocols (Config.INFERENCE_PROTOCOL)
+# ==========================================================================
+def parse_protocol(name):
+    """'full' | 'tiled<P>' with optional '+x8' -> (mode, tile, self_ensemble)."""
+    base, _, ens = name.partition('+')
+    if base == 'full':
+        return 'full', None, ens == 'x8'
+    if base.startswith('tiled'):
+        return 'tiled', int(base[5:] or 256), ens == 'x8'
+    raise ValueError(f'unknown inference protocol {name!r}')
+
+
+def sin2_window(P, device):
+    """w(n) = sin^2(pi (n + 1/2) / P): w(n) + w(n + P/2) = 1, i.e. overlap-add with hop P/2 is an exact
+    partition of unity (Princen-Bradley condition) in each axis; the 2-D window is the outer product.
+    It also vanishes at the tile borders, where the SRB places its bias impulse and the cyclic shift wraps."""
+    n = torch.arange(P, device=device, dtype=torch.float32)
+    w = torch.sin(math.pi * (n + 0.5) / P) ** 2
+    return w[:, None] * w[None, :]
+
+
+def _full_forward(model, x, x_prompt=None):
+    override = None
+    if x_prompt is not None and getattr(model, 'use_prompt', False):
+        override = model.prompt_learner(model.check_image_size(x_prompt)[0])
+    return model(x, prompt_override=override)
+
+
+def tiled_forward(model, x, P, batch=32, x_prompt=None):
+    """Train-consistent inference: overlapping P x P tiles (hop P/2, sin^2 overlap-add).  The image is
+    reflect-padded by P/2 (and up to a multiple of P/2) so that every tile is a full P x P input and every
+    pixel is covered by exactly 2 x 2 tiles whose weights sum to 1.  Images not larger than P go through
+    the model directly (that already is the training regime).  Returns (output, mean descriptor)."""
+    _, C, H, W = x.shape
+    if H <= P and W <= P:
+        return _full_forward(model, x, x_prompt)
+    h = P // 2
+    Hp, Wp = math.ceil((H + 2 * h) / h) * h, math.ceil((W + 2 * h) / h) * h
+    pads = (h, Wp - W - h, h, Hp - H - h)
+    mode = 'reflect' if min(H, W) > max(pads) else 'replicate'
+    xp = F.pad(x, pads, mode=mode)
+    xq = F.pad(x_prompt, pads, mode=mode) if x_prompt is not None else None
+    win = sin2_window(P, x.device)
+    acc = torch.zeros((1, C, Hp, Wp), device=x.device, dtype=torch.float32)
+    pos = [(i, j) for i in range(0, Hp - P + 1, h) for j in range(0, Wp - P + 1, h)]
+    prompts = []
+    for k in range(0, len(pos), batch):
+        chunk = pos[k:k + batch]
+        tiles = torch.cat([xp[:, :, i:i + P, j:j + P] for i, j in chunk])
+        tq = torch.cat([xq[:, :, i:i + P, j:j + P] for i, j in chunk]) if xq is not None else None
+        y, p = _full_forward(model, tiles, tq)
+        for t, (i, j) in enumerate(chunk):
+            acc[:, :, i:i + P, j:j + P] += y[t:t + 1].float() * win
+        if p is not None:
+            prompts.append(p.float())
+    out = acc[:, :, h:h + H, h:h + W].clamp(0, 1)
+    return out, (torch.cat(prompts).mean(0, keepdim=True) if prompts else None)
+
+
+_DIHEDRAL = [(k, f) for f in (False, True) for k in range(4)]
+
+
+def _d4(t, k, f):
+    t = torch.flip(t, dims=[3]) if f else t
+    return torch.rot90(t, k, dims=[2, 3])
+
+
+def _d4_inv(t, k, f):
+    t = torch.rot90(t, -k, dims=[2, 3])
+    return torch.flip(t, dims=[3]) if f else t
+
+
+@torch.no_grad()
+def run_model(model, x, protocol='full', x_prompt=None, tile_batch=32):
+    """Restored image and descriptor of `x` under an inference protocol (weights untouched)."""
+    mode, P, ens = parse_protocol(protocol)
+    fwd = (lambda a, q: tiled_forward(model, a, P, tile_batch, q)) if mode == 'tiled' else (lambda a, q: _full_forward(model, a, q))
+    if not ens:
+        return fwd(x, x_prompt)
+    outs, ps = [], []
+    for k, f in _DIHEDRAL:
+        y, p = fwd(_d4(x, k, f), _d4(x_prompt, k, f) if x_prompt is not None else None)
+        outs.append(_d4_inv(y.float(), k, f))
+        if p is not None:
+            ps.append(p.float())
+    return torch.stack(outs).mean(0), (torch.stack(ps).mean(0) if ps else None)
+
+
+# ==========================================================================
+# Registration before scoring (benchmarks with align='ecc', i.e. Koehler)
+# ==========================================================================
+def ecc_align(pred, gt):
+    """RealBlur evaluation protocol (Rim et al., ECCV 2020): least-squares intensity scaling of `pred`
+    to `gt`, ECC homography (OpenCV, gaussFiltSize 5) of `pred` onto `gt`, then both images restricted
+    to the region covered by the warped image (here: its largest centred inner rectangle, so that every
+    metric of the single metric function can be applied).  Tensors 1x3xHxW in [0, 1]."""
+    import cv2
+    z = pred[0].permute(1, 2, 0).float().cpu().numpy().astype(np.float32)
+    x = gt[0].permute(1, 2, 0).float().cpu().numpy().astype(np.float32)
+    zs = np.clip(float((x * z).sum() / max((z * z).sum(), 1e-8)) * z, 0, 1).astype(np.float32)
+    warp = np.eye(3, dtype=np.float32)
+    ok = True
+    try:
+        _, warp = cv2.findTransformECC(cv2.cvtColor(x, cv2.COLOR_RGB2GRAY), cv2.cvtColor(zs, cv2.COLOR_RGB2GRAY), warp,
+                                       cv2.MOTION_HOMOGRAPHY, (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 0), None, 5)
+    except cv2.error:
+        ok, warp = False, np.eye(3, dtype=np.float32)
+    H, W = x.shape[:2]
+    zr = cv2.warpPerspective(zs, warp, (W, H), flags=cv2.INTER_CUBIC + cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_REFLECT)
+    cr = cv2.warpPerspective(np.ones((H, W), np.float32), warp, (W, H), flags=cv2.INTER_NEAREST + cv2.WARP_INVERSE_MAP,
+                             borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    t, b, l, r = 0, H, 0, W   # shrink a centred rectangle until it lies inside the valid region
+    while t < b - 16 and l < r - 16 and cr[t:b, l:r].min() < 1:
+        t, b, l, r = t + 1, b - 1, l + 1, r - 1
+    to_t = lambda a: torch.from_numpy(np.ascontiguousarray(np.clip(a[t:b, l:r], 0, 1))).permute(2, 0, 1).unsqueeze(0)
+    return to_t(zr), to_t(x), dict(ecc_converged=ok, crop=(t, H - b, l, W - r))
+
+
+def _source_desc(cfg, key):
+    for attr in ('KAGGLE_SOURCES', 'HF_ZIP_SOURCES', 'HF_PARQUET_SOURCES', 'GDOWN_SOURCES'):
+        d = getattr(cfg, attr, None) or {}
+        if key in d:
+            return [attr, d[key]]
+    return [key]
+
+
+def eval_signature(cfg, bench, protocol, extra=None):
+    """Everything a stored result depends on: benchmark definition and its data sources, inference
+    protocol, registration, metric protocol.  A stored summary with another signature is recomputed."""
+    b = cfg.benchmarks()
+    spec = b[bench]
+    srcs = sorted(set(spec_sources(spec, b)))
+    blob = [bench, spec, b.get(spec.get('base')), [_source_desc(cfg, k) for k in srcs], protocol, cfg.SYNTHETIC_SEED,
+            METRIC_PROTOCOL_VERSION, extra]
+    return hashlib.md5(json.dumps(blob, sort_keys=True, default=str).encode()).hexdigest()
+
+
+METRIC_PROTOCOL_VERSION = 2   # 2: per-benchmark registration (Koehler), inference protocols
+
+
+def _centre_crop(t, max_hw):
+    H, W = t.shape[-2:]
+    mh, mw = max_hw if H <= W else max_hw[::-1]
+    h, w = min(H, mh), min(W, mw)
+    t0, l0 = (H - h) // 2, (W - w) // 2
+    return t[..., t0:t0 + h, l0:l0 + w]
+
+
+@torch.no_grad()
+def select_inference_protocol(cfg, model, val_items, device, out_dir):
+    """Chooses the inference protocol on the held-out validation pairs of the training pool at full
+    resolution (centre crop to INFERENCE_SELECT_MAX_SIZE), never on a test set.  Criterion: mean over
+    categories of the per-category mean PSNR; 'full' is kept unless another protocol gains at least
+    INFERENCE_SELECT_MIN_GAIN dB.  Writes selection.json and a per-category table."""
+    suite = MetricSuite(device, ('psnr', 'ssim'))
+    per = {c: {} for c in cfg.INFERENCE_CANDIDATES}
+    sizes = []
+    for it in tqdm(val_items, desc='inference protocol selection', leave=False):
+        x = _centre_crop(TF.to_tensor(Image.open(it['input']).convert('RGB')), cfg.INFERENCE_SELECT_MAX_SIZE).unsqueeze(0)
+        g = _centre_crop(TF.to_tensor(Image.open(it['gt']).convert('RGB')), cfg.INFERENCE_SELECT_MAX_SIZE).unsqueeze(0)
+        if x.shape != g.shape:
+            continue
+        sizes.append(x.shape[-2] * x.shape[-1])
+        x = x.to(device)
+        for c in cfg.INFERENCE_CANDIDATES:
+            y, _ = run_model(model, x, c, tile_batch=cfg.TILE_BATCH)
+            m = suite(y, g)
+            per[c].setdefault(it['category'], []).append((m['psnr'][0], m['ssim'][0]))
+    rows, score = [], {}
+    cats = sorted({k for c in per for k in per[c]})
+    for c in cfg.INFERENCE_CANDIDATES:
+        row = dict(protocol=c)
+        for k in cats:
+            row[k] = float(np.mean([v[0] for v in per[c].get(k, [])])) if per[c].get(k) else None
+        score[c] = float(np.mean([row[k] for k in cats if row[k] is not None])) if cats else float('nan')
+        row['mean_over_categories_psnr'] = score[c]
+        row['mean_ssim'] = float(np.mean([v[1] for k in cats for v in per[c].get(k, [])])) if cats else None
+        rows.append(row)
+    best = max(score, key=lambda c: score[c])
+    chosen = 'full' if ('full' in score and score[best] - score['full'] < cfg.INFERENCE_SELECT_MIN_GAIN) else best
+    os.makedirs(out_dir, exist_ok=True)
+    write_rows(rows, os.path.join(out_dir, 'validation_per_category.csv'))
+    sel = dict(selected=chosen, scores=score, criterion='mean over categories of the mean PSNR on the held-out validation '
+               'pairs (full resolution, centre crop to %dx%d), never a test set' % tuple(cfg.INFERENCE_SELECT_MAX_SIZE),
+               n_images=len(sizes), median_pixels=float(np.median(sizes)) if sizes else None, candidates=cfg.INFERENCE_CANDIDATES)
+    write_json(sel, os.path.join(out_dir, 'selection.json'))
+    print('[protocol] validation PSNR: ' + ', '.join(f'{c} {v:.3f}' for c, v in score.items()) + f'  -> {chosen}')
+    return sel
+
+
 class Evaluator:
     def __init__(self, cfg, roots, device=None, metric_names=('psnr', 'ssim', 'lpips', 'dists', 'psnr_y', 'ssim_y')):
         self.cfg, self.roots = cfg, roots
@@ -78,6 +273,8 @@ class Evaluator:
         self.metric_names = tuple(metric_names)
         self.metrics = MetricSuite(self.device, self.metric_names)
         self._light = None
+        # inference protocol of every evaluation (main.Experiment sets the selected one when 'auto')
+        self.protocol = 'full' if cfg.INFERENCE_PROTOCOL == 'auto' else cfg.INFERENCE_PROTOCOL
 
     @property
     def light(self):  # PSNR/SSIM only, for inputs
@@ -97,16 +294,38 @@ class Evaluator:
     def bench_dir(self, run_id, bench, tag=''):
         return os.path.join(self.cfg.run_dir(run_id), 'eval', bench + tag)
 
+    def signature(self, bench, tag=''):
+        return eval_signature(self.cfg, bench, self.protocol, tag)
+
     def is_done(self, run_id, bench, tag=''):
-        return os.path.exists(os.path.join(self.bench_dir(run_id, bench, tag), 'summary.json'))
+        """A stored result counts only if it was computed with the current data, protocol and metrics."""
+        summ = read_json(os.path.join(self.bench_dir(run_id, bench, tag), 'summary.json'))
+        return bool(summ) and summ.get('eval_signature') == self.signature(bench, tag)
+
+    def prepare(self, bench, out, gt):
+        """Pair actually scored: registered to the reference for benchmarks with align='ecc'."""
+        if self.cfg.benchmarks()[bench].get('align') == 'ecc':
+            a, g, info = ecc_align(out, gt)
+            return a, g, info
+        return out, gt, None
 
     # ----------------------------------------------------------- evaluate
     @torch.no_grad()
     def evaluate(self, model, run_id, bench, prompt_mode=None, save_images=False, collect_prompts=False,
-                 max_images=None, metric_names=None, force=False):
+                 max_images=None, metric_names=None, force=False, protocol=None):
         """prompt_mode=None: normal inference.  prompt_mode='first': for mixed benchmarks the
         descriptor p is replaced by the descriptor of the singly-degraded image (control)."""
-        tag = '' if prompt_mode is None else f'__prompt_{prompt_mode}'
+        tag = ('' if prompt_mode is None else f'__prompt_{prompt_mode}') + \
+              ('' if protocol in (None, self.protocol) else f'__protocol_{protocol}')
+        if protocol in (None, self.protocol):
+            return self._evaluate(model, run_id, bench, tag, prompt_mode, save_images, collect_prompts, max_images, metric_names, force)
+        saved, self.protocol = self.protocol, protocol   # evaluation under another protocol (reported only)
+        try:
+            return self._evaluate(model, run_id, bench, tag, prompt_mode, False, collect_prompts, max_images, metric_names, force)
+        finally:
+            self.protocol = saved
+
+    def _evaluate(self, model, run_id, bench, tag, prompt_mode, save_images, collect_prompts, max_images, metric_names, force):
         out_dir = self.bench_dir(run_id, bench, tag)
         if self.is_done(run_id, bench, tag) and not force and not collect_prompts:
             return read_json(os.path.join(out_dir, 'summary.json'))
@@ -114,26 +333,29 @@ class Evaluator:
         suite = self.metrics if set(names) <= set(self.metric_names) else MetricSuite(self.device, names)
         ds = BenchmarkDataset(self.cfg, self.roots, bench, max_images=max_images)
         loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=min(6, self.cfg.NUM_WORKERS), collate_fn=collate_single)
-        rows, prompts, n_resized = [], [], 0
+        rows, prompts, n_resized, n_unaligned = [], [], 0, 0
         amp = bool(self.cfg.EVAL_AMP and self.device.type == 'cuda')
         torch.backends.cudnn.benchmark = False   # test images have many different sizes
         for item in tqdm(loader, desc=f'{run_id} | {bench}{tag}', leave=False):
             x = item['input'].unsqueeze(0).to(self.device)
             gt = item['gt'].unsqueeze(0)
-            override = None
+            xf = None
             if prompt_mode == 'first' and 'first' in item and getattr(model, 'use_prompt', False):
                 xf = item['first'].unsqueeze(0).to(self.device)
-                override = model.prompt_learner(model.check_image_size(xf)[0])
             if self.device.type == 'cuda':
                 torch.cuda.synchronize()
             t0 = time.time()
             with torch.autocast(device_type=self.device.type, enabled=amp):
-                out, p = model(x, prompt_override=override)
+                out, p = run_model(model, x, self.protocol, x_prompt=xf, tile_batch=self.cfg.TILE_BATCH)
             if self.device.type == 'cuda':
                 torch.cuda.synchronize()
             ms = (time.time() - t0) * 1000
-            m = suite(out, gt)
-            mi = self.light(x, gt)
+            out_s, gt_s, info = self.prepare(bench, out.float(), gt.to(out.device))
+            in_s, gt_i, _ = self.prepare(bench, x.float(), gt.to(x.device))
+            m = suite(out_s, gt_s)
+            mi = self.light(in_s, gt_i)
+            if info is not None:
+                n_unaligned += int(not info['ecc_converged'])
             n_resized += int(bool(item.get('gt_resized')))
             row = dict(image=item['name'], key=item['key'])
             for k in names:
@@ -146,6 +368,8 @@ class Evaluator:
                 save_png(out[0], os.path.join(out_dir, 'restored', os.path.splitext(item['name'])[0] + '.png'))
         write_rows(rows, os.path.join(out_dir, 'per_image.csv'))
         summ = dict(run_id=run_id, benchmark=bench, prompt_mode=prompt_mode, n_images=len(rows), n_gt_resized=n_resized,
+                    inference_protocol=self.protocol, eval_signature=self.signature(bench, tag),
+                    registration=self.cfg.benchmarks()[bench].get('align'), n_ecc_not_converged=n_unaligned,
                     dataset_report=ds.report)
         for k in list(names) + ['input_psnr', 'input_ssim']:
             v = [r[k] for r in rows]
@@ -160,7 +384,8 @@ class Evaluator:
         rec.setdefault('eval', {})[bench + tag] = {k: summ[k] for k in summ if k not in ('dataset_report',)}
         write_json(rec, rj)
         print(f'[eval] {run_id:22s} {bench + tag:28s} n={len(rows):5d}  PSNR {summ["psnr"]:.2f}  SSIM {summ["ssim"]:.3f}'
-              f'  (input {summ["input_psnr"]:.2f}/{summ["input_ssim"]:.3f})')
+              f'  (input {summ["input_psnr"]:.2f}/{summ["input_ssim"]:.3f})  [{self.protocol}'
+              f'{", registered" if summ["registration"] else ""}]')
         return summ
 
     # --------------------------------------------------------- competitors
@@ -168,7 +393,8 @@ class Evaluator:
     def score_folder(self, bench, method, folder, out_csv):
         """Score restored images of another method with the same metric function.
         Files are matched by input stem, ground-truth stem or pairing key."""
-        if os.path.exists(out_csv):
+        sig = eval_signature(self.cfg, bench, 'competitor', [method, folder])
+        if os.path.exists(out_csv) and read_json(out_csv.replace('.csv', '.json'), {}).get('eval_signature') == sig:
             return read_rows(out_csv)
         if not os.path.isdir(folder):
             print(f'[competitor] {method} on {bench}: folder {folder} missing -> skipped')
@@ -190,11 +416,12 @@ class Evaluator:
             if r.shape != it['gt'].shape:
                 shape_mismatch += 1
                 continue
-            m = self.metrics(r.unsqueeze(0), it['gt'].unsqueeze(0))
+            r_s, g_s, _ = self.prepare(bench, r.unsqueeze(0), it['gt'].unsqueeze(0))
+            m = self.metrics(r_s, g_s)
             rows.append(dict(image=it['name'], key=it['key'], **{k: m[k][0] for k in self.metric_names}))
         write_rows(rows, out_csv)
         write_json(dict(method=method, benchmark=bench, folder=folder, n_scored=len(rows), n_missing=missing,
-                        n_shape_mismatch=shape_mismatch), out_csv.replace('.csv', '.json'))
+                        n_shape_mismatch=shape_mismatch, eval_signature=sig), out_csv.replace('.csv', '.json'))
         print(f'[competitor] {method:14s} {bench:10s} scored {len(rows)} (missing {missing}, shape mismatch {shape_mismatch})')
         return rows
 

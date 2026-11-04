@@ -688,6 +688,94 @@ def spectral_report(cfg, roots, model, device, benches=None, n_images=30):
     return out_rows, srb_rows
 
 
+def protocol_effect_report(cfg, evaluator, model, run_id, benches=None):
+    """Test-set effect of the inference protocol (reported only; the protocol itself was chosen on the
+    held-out validation pairs): every main benchmark with the selected protocol and with 'full'."""
+    benches = benches or cfg.MAIN_BENCHMARKS
+    sel, rows = evaluator.protocol, []
+    if sel == 'full':
+        print('[protocol] the selected protocol is the full-image pass: nothing to compare')
+        return rows
+    for b in benches:
+        try:
+            a = evaluator.evaluate(model, run_id, b, metric_names=('psnr', 'ssim'))
+            f = evaluator.evaluate(model, run_id, b, metric_names=('psnr', 'ssim'), protocol='full')
+        except FileNotFoundError as e:
+            print(f'[protocol] {b} skipped: {e}')
+            continue
+        rows.append(dict(benchmark=b, n=a['n_images'], protocol=sel, psnr=a['psnr'], ssim=a['ssim'],
+                         psnr_full_image=f['psnr'], ssim_full_image=f['ssim'], delta_psnr=a['psnr'] - f['psnr'],
+                         delta_ssim=a['ssim'] - f['ssim']))
+    save_table(rows, 'table_inference_protocol_test', cfg, digits=dict(n=0, psnr=2, psnr_full_image=2, delta_psnr=2,
+                                                                       ssim=3, ssim_full_image=3, delta_ssim=3))
+    return rows
+
+
+@torch.no_grad()
+def srb_consistency_report(cfg, roots, model, device, benches=None, n_images=10, P=256):
+    """Why the inference protocol matters (R3-2 / R5-2).
+    (a) Exact spatial form of every SRB.  The real 1x1 conv W = [[A, B], [C, D]] on [Re F; Im F] equals
+        alpha F + beta conj(F) with alpha = ((A+D) + i(C-B))/2, beta = ((A-D) + i(C+B))/2, i.e. in image space
+        y = a_r x + a_i Qx + b_r Rx + b_i QRx  (R: point reflection x(-n mod N), Q: quadrature transform =
+        irFFT2(i rFFT2(.))).  The anti-linear terms (beta) couple every position with the opposite position
+        of the WHOLE map: inside a 256x256 training patch, or across a whole 720x1280 test frame.
+        Table: energy share of each term per SRB (from the weights only).
+    (b) Train/test gap of the resonance gate: input of the gate (mean un-normalised amplitude) and gate
+        value on full test images vs on their P x P tiles (the training regime)."""
+    srbs = {n: m for n, m in model.named_modules() if isinstance(m, SpectralResonanceBlock)}
+    rows_a = []
+    for n, m in srbs.items():
+        Wt = m.freq_conv.weight.detach().float()[:, :, 0, 0].cpu()
+        c = Wt.shape[0] // 2
+        A, B, Cm, D = Wt[:c, :c], Wt[:c, c:], Wt[c:, :c], Wt[c:, c:]
+        e = dict(identity_mix=((A + D) / 2).pow(2).sum(), quadrature=((Cm - B) / 2).pow(2).sum(),
+                 reflection=((A - D) / 2).pow(2).sum(), reflection_quadrature=((Cm + B) / 2).pow(2).sum())
+        tot = float(sum(e.values()))
+        rows_a.append(dict(srb=n, channels=c, **{f'share_{k}': float(v) / tot for k, v in e.items()},
+                           anti_linear_share=float(e['reflection'] + e['reflection_quadrature']) / tot,
+                           bias_norm=float(m.freq_conv.bias.detach().norm()) if m.freq_conv.bias is not None else 0.0))
+    save_table(rows_a, 'spectral_srb_operator_decomposition', cfg, digits=dict(channels=0))
+    benches = benches or cfg.MAIN_BENCHMARKS
+    cap = {}
+    hooks = [m.register_forward_pre_hook(lambda mod, inp, n=n: cap.__setitem__(n, inp[0].detach())) for n, m in srbs.items()]
+    acc = {}
+    try:
+        for bench in benches:
+            try:
+                ds = BenchmarkDataset(cfg, roots, bench, max_images=n_images)
+            except Exception as e:
+                print(f'[srb-consistency] {bench} skipped: {e}')
+                continue
+            for i in range(len(ds)):
+                x = ds[i]['input'].unsqueeze(0).to(device)
+                H, W = x.shape[2:]
+                if H <= P or W <= P:
+                    continue
+                x = x[:, :, :min(H, 720) // 16 * 16, :min(W, 1280) // 16 * 16]
+                cap.clear(); model(x); full = dict(cap)
+                tiles = torch.cat([x[:, :, a:a + P, b:b + P] for a in range(0, x.shape[2] - P + 1, P)
+                                   for b in range(0, x.shape[3] - P + 1, P)])
+                cap.clear(); model(tiles); tl = dict(cap)
+                for n, m in srbs.items():
+                    gf, gt_ = m.trace(full[n])['gate'], m.trace(tl[n])['gate']
+                    sf = torch.fft.rfft2(full[n].float()).abs().mean().item()
+                    st = torch.fft.rfft2(tl[n].float()).abs().mean().item()
+                    L = acc.setdefault((bench, n), dict(gate_input_full=[], gate_input_tile=[], gate_full=[], gate_tile=[], gate_abs_diff=[]))
+                    L['gate_input_full'].append(sf); L['gate_input_tile'].append(st)
+                    L['gate_full'].append(float(gf.mean())); L['gate_tile'].append(float(gt_.mean()))
+                    L['gate_abs_diff'].append(float((gf.mean(0) - gt_.mean(0)).abs().mean()))
+    finally:
+        for h in hooks:
+            h.remove()
+    rows_b = []
+    for (bench, n), L in acc.items():
+        r = dict(benchmark=bench, srb=n, n=len(L['gate_full']), **{k: float(np.mean(v)) for k, v in L.items()})
+        r['gate_input_ratio_full_over_tile'] = r['gate_input_full'] / max(r['gate_input_tile'], 1e-12)
+        rows_b.append(r)
+    save_table(rows_b, 'spectral_srb_train_test_gap', cfg, digits=dict(n=0))
+    return rows_a, rows_b
+
+
 # ==========================================
 # 8. qualitative figures (TODO-06)
 # ==========================================
@@ -933,9 +1021,12 @@ def section41_report(cfg):
                              gpu=rec.get('environment', {}).get('gpu'), selected=rec.get('selection', {}).get('selected'),
                              best_val_psnr=rec.get('selection', {}).get('best_val_psnr')))
     save_table(runs, 'section41_runs', cfg, digits=dict(seed=0, epochs=0, iterations=0, total_iters=0, wall_clock_h=2, best_val_psnr=2))
-    full = read_json(os.path.join(cfg.run_dir(cfg.FULL_RUN_ID), 'run.json'), {})
+    full = read_json(os.path.join(cfg.run_dir(cfg.report_run_id()), 'run.json'), {})
+    reference = read_json(os.path.join(cfg.run_dir(cfg.FULL_RUN_ID), 'run.json'), {})
     man = read_json(os.path.join(cfg.manifest_dir, 'train_manifest.json'), {})
-    rep = dict(full_run=full, data_categories=man.get('categories'), leakage_audit=man.get('audit'), metric_protocol=PROTOCOL,
+    rep = dict(full_run=full, reference_run_of_ablations=reference,
+               inference_protocol=read_json(os.path.join(cfg.analysis_dir('inference_protocol'), 'selection.json'), {}),
+               data_categories=man.get('categories'), leakage_audit=man.get('audit'), metric_protocol=PROTOCOL,
                total_gpu_hours_all_runs=float(np.nansum([r['wall_clock_h'] or 0 for r in runs])))
     write_json(rep, os.path.join(cfg.tables_dir, 'section41_reproducibility.json'))
     return rep

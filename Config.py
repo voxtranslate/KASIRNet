@@ -16,7 +16,7 @@ class Config:
     # main() executes these stages in order; each one is idempotent (a finished run
     # or analysis is detected from its JSON and skipped), so the notebook can be
     # re-run in as many Colab sessions as needed.
-    STAGES = ['audit', 'train_full', 'eval_full', 'analyses_full', 'ablations', 'analyses_ablation', 'tables']
+    STAGES = ['audit', 'train_full', 'train_main', 'eval_full', 'analyses_full', 'ablations', 'analyses_ablation', 'tables']
 
     # ---------------------------------------------------------------- hardware
     # Colab "G4" runtime = NVIDIA RTX PRO 6000 Blackwell Server Edition (96 GB).
@@ -27,6 +27,23 @@ class Config:
     AMP = True                    # mixed precision (paper: FP16)
     AMP_DTYPE = 'float16'         # 'float16' (paper) or 'bfloat16'
     EVAL_AMP = False              # all reported metrics are computed with an FP32 forward pass
+    # ---------------------------------------------------------------- inference protocol
+    # Several operators of KASIRNet aggregate over the WHOLE input: the SRB resonance gate (mean of the
+    # un-normalised FFT amplitude: on a 720x1280 frame it is ~3.75x larger than on the 256x256 training
+    # patches), the anti-linear / quadrature part of the SRB complex 1x1 mixing (point reflection and
+    # row-wise Hilbert transform of the whole map), the SIM channel attention and Prompt-Learner global
+    # pooling, the GCB softmax pooling and the Meshgrid coordinates (stretched over the whole image).
+    # A full-image forward pass therefore feeds them statistics never seen in training (cf. TLC, Chu et
+    # al., ECCV 2022).  'tiledP' restores every image from overlapping PxP tiles (hop P/2, sin^2 window =
+    # exact partition of unity, reflect-padded borders so that every tile has full size): each operator
+    # then sees exactly the training regime; images not larger than P go through the model directly.
+    # The weights are untouched.  'auto' selects the protocol once, on the held-out validation images of
+    # the training pool at full resolution (never on a test set): INFERENCE_CANDIDATES.
+    INFERENCE_PROTOCOL = 'auto'   # 'auto' | 'full' | 'tiled256' | 'tiled384' (+ '+x8' = 8-fold self-ensemble)
+    INFERENCE_CANDIDATES = ['full', 'tiled256', 'tiled384']
+    INFERENCE_SELECT_MAX_SIZE = (720, 1280)   # validation images are centre-cropped to at most this size
+    INFERENCE_SELECT_MIN_GAIN = 0.02          # dB; below this the simpler protocol ('full') is kept
+    TILE_BATCH = 32
     CUDNN_BENCHMARK = True
     DETERMINISTIC = False         # True -> cudnn.deterministic (slower); seeds are always fixed
     MAX_SESSION_HOURS = 23.5      # save + stop cleanly before a Colab session is recycled
@@ -54,6 +71,7 @@ class Config:
     DATA_CACHE_REFRESH = False    # True: rebuild the tars of this session's sources
     # Google-Drive archives often fail with "quota exceeded".  A copy of the archive placed by hand in
     # DATA_CACHE_ROOT/archives/<file name> (Drive web page -> "Make a copy" / "Add shortcut") is used first.
+    WEIGHTS_CACHE = '/content/drive/MyDrive/KASIRNet_revision/weights_cache'   # pretrained networks (torch hub cache copy)
     LEGACY_CHECKPOINT = '/content/drive/MyDrive/Checkpoints/KASIRNet/best.pth'        # submitted model (audit only)
     LEGACY_NOSIM_CHECKPOINT = ''                                                       # submitted "w/o SIM" model, if kept
     # Competitor outputs held by the authors (restored images named like the test inputs).
@@ -80,7 +98,10 @@ class Config:
         'realblur_j': 'adwythdarsanr/realblurj-image-deblurring-dataset',  # RealBlur-J official split: train 3758 (182 scenes) / test 980 (50 scenes)
         'jrdr':     'shivakanthsujit/jrdr-deraining-dataset',  # RainTrainH / RainTrainL (1800 each)
         'raindrop': 'chenchienying/deraindataset',             # DeRaindrop: train 861 / test_a 58 / test_b 249
-        'rain100l': 'bshaurya/rain-dataset',                   # Rain100L test, original 481x321 (rain-/norain-xxx.png)
+        'rain100l': 'adeshpal/rain-100l',                      # Rain100L test (100 pairs, Rain100L/{input,target}/<n>.png, 480x320:
+                                                               # the MPRNet/Restormer test layout; input 25.5 dB RGB).  NOT
+                                                               # bshaurya/rain-dataset: that one is Rain100H (input 12.1 dB, the
+                                                               # same 100 pairs as alicewen820/rain100h)
         'rain100h': 'alicewen820/rain100h',                    # Rain100H test (100)
         'reside6k': 'kmljts/reside-6k',                        # RESIDE-6K train 6000 / test 1000
         'sidd':     'soumikrakshit/smartphone-image-denoising-dataset',  # SIDD-Medium sRGB (320) + SIDD val crops (lmdb)
@@ -251,8 +272,13 @@ class Config:
         'gopro':      dict(family='blur',  input=('dblur', 'DBlur/Gopro/test/blur'),   gt=('dblur', 'DBlur/Gopro/test/sharp')),
         'hide':       dict(family='blur',  input=('dblur', 'DBlur/HIDE/test/blur'),    gt=('dblur', 'DBlur/HIDE/test/sharp')),
         'textocr':    dict(family='blur',  input=('dblur', 'DBlur/TextOCR/test/blur'), gt=('dblur', 'DBlur/TextOCR/test/sharp')),
-        'kohler':     dict(family='blur',  input=('kohler', 'kohler/blur'), gt=('kohler', 'kohler/sharp'), match=_KOHLER_MATCH),
-        'rain100l':   dict(family='rain',  input=('rain100l', '.'), gt=('rain100l', '.'), match=('regex', r'^rain-(\d+)$', r'^norain-(\d+)$')),
+        # Koehler: the 12 blurred images of a scene share ONE sharp reference and are shifted from it by up to
+        # 10 px, so a perfectly deblurred image still scores below the blurred one.  align='ecc' registers every
+        # restored image (and the input) to the reference before scoring, as the RealBlur protocol (Rim et al.,
+        # ECCV 2020): least-squares intensity scaling + ECC homography, metrics on the valid region.
+        'kohler':     dict(family='blur',  input=('kohler', 'kohler/blur'), gt=('kohler', 'kohler/sharp'), match=_KOHLER_MATCH,
+                           align='ecc'),
+        'rain100l':   dict(family='rain',  input=('rain100l', 'Rain100L/input'), gt=('rain100l', 'Rain100L/target')),
         'reside6k':   dict(family='haze',  input=('reside6k', 'RESIDE-6K/test/hazy'), gt=('reside6k', 'RESIDE-6K/test/GT')),
         'snow100k_l': dict(family='snow',  input=('snow_test_l', 'AllWeather_Testing/Snow100K-L/input'), gt=('snow_test_l', 'AllWeather_Testing/Snow100K-L/gt')),
         'sidd':       dict(family='noise', lmdb=('sidd', 'SIDD-val-lmdb/SIDD/val/input_crops.lmdb'), lmdb_gt=('sidd', 'SIDD-val-lmdb/SIDD/val/gt_crops.lmdb')),
@@ -274,6 +300,15 @@ class Config:
         'mix_rain100l_haze':  dict(family='mixed', base='rain100l', degrade=[('haze', 1.0, 0.8)], families=('rain', 'haze')),
         'mix_snow100kl_g25':  dict(family='mixed', base='snow100k_l', degrade=[('gaussian', 25)], families=('snow', 'noise')),
     }
+    # Fingerprints of the real test sets: (number of pairs, mean input PSNR in dB, RGB, full resolution)
+    # measured on the verified sources.  validate_data() compares a sample of each benchmark with them and
+    # stops the audit when a source holds another test set (e.g. Rain100H served as Rain100L).
+    BENCHMARK_FINGERPRINTS = {
+        'gopro': (1111, 25.11), 'hide': (2025, 23.95), 'textocr': (500, 22.07), 'kohler': (48, 20.27),
+        'rain100l': (100, 25.52), 'rain100h': (100, 12.13), 'reside6k': (1000, 13.96), 'snow100k_l': (16801, 18.68),
+        'sidd': (1280, 23.66), 'snow100k_s': (713, 25.07), 'snow100k_m': (662, 22.90), 'lol': (15, 7.77), 'dpdd': (76, 23.89),
+    }
+    FINGERPRINT_TOL_DB = 2.0      # a sample of VALIDATE_SAMPLES pairs; Rain100L vs Rain100H differ by 13 dB
     MAIN_BENCHMARKS = ['gopro', 'hide', 'textocr', 'kohler', 'rain100l', 'reside6k', 'snow100k_l', 'sidd']
     EXTRA_BENCHMARKS = ['rain100h', 'snow100k_s', 'snow100k_m', 'cbsd68_g15', 'cbsd68_g25', 'cbsd68_g50',
                         'live1_q10', 'lol', 'dpdd', 'mix_gopro_g25', 'mix_rain100l_haze', 'mix_snow100kl_g25']
@@ -284,7 +319,8 @@ class Config:
     # ----------------------------------------------- training (Section 4.1)
     PATCH_SIZE = 256
     BATCH_SIZE = 64               # G4 (96 GB); Section 4.1 must state batch 64 (the submitted paper said 6)
-    LR = 1e-4
+    LR = 1e-4                     # reference full model (KASIRNet_full) and every ablation run
+    WARMUP_ITERS = 0
     BETAS = (0.9, 0.999)
     WEIGHT_DECAY = 0.0
     ETA_MIN = 1e-7                # cosine annealing per iteration from LR to ETA_MIN over the whole budget
@@ -297,6 +333,19 @@ class Config:
     # never trained a second time.  main() prints the measured s/iteration and the GPU-hours left.
     EPOCHS = 100
     ABLATION_EPOCHS = 100
+    # Final model of Tables 4-5 (run MAIN_RUN_ID).  At batch 64 the 100-epoch recipe makes only 35,700
+    # parameter updates at the learning rate of the batch-6 paper setting (1e-4): ~10x fewer updates than
+    # the paper and 3-8x fewer than comparable all-in-one models (PromptIR, AdaIR: 120-150 epochs).  The
+    # final model therefore continues KASIRNet_full with a second cosine cycle (warm restart, SGDR,
+    # Loshchilov & Hutter, ICLR 2017) of MAIN_EPOCHS epochs at MAIN_LR = 3e-4 (square-root scaling of the
+    # paper learning rate to batch 64: 1e-4 x sqrt(64/6) = 3.3e-4; Malladi et al., NeurIPS 2022), with a
+    # linear warm-up.  Total 300 epochs / 107,100 updates.  MAIN_INIT_FROM = None trains it from scratch
+    # (then set MAIN_EPOCHS = 300).  MAIN_EPOCHS = 0 reports KASIRNet_full itself.
+    MAIN_RUN_ID = 'KASIRNet_main'
+    MAIN_INIT_FROM = 'KASIRNet_full'
+    MAIN_EPOCHS = 200
+    MAIN_LR = 3e-4
+    MAIN_WARMUP_ITERS = 1500
     CKPT_EVERY_ITERS = 2000       # resumable checkpoint (atomic write) every N iterations
     VAL_EVERY_ITERS = 5000
     LOG_EVERY_ITERS = 100
@@ -338,6 +387,14 @@ class Config:
             setattr(self, k, copy.deepcopy(v))
         self.MODEL = copy.deepcopy(self.MODEL)
         self.LOSS_WEIGHTS = copy.deepcopy(self.LOSS_WEIGHTS)
+
+    def report_run_id(self):
+        """The model reported in Tables 4-5 and analysed (final model if configured, else KASIRNet_full)."""
+        return self.MAIN_RUN_ID if self.MAIN_EPOCHS > 0 else self.FULL_RUN_ID
+
+    def main_run(self):
+        return dict(run_id=self.MAIN_RUN_ID, group='main', seed=self.SEED, epochs=self.MAIN_EPOCHS, model={}, loss={},
+                    lr=self.MAIN_LR, warmup=self.MAIN_WARMUP_ITERS, init_from=self.MAIN_INIT_FROM)
 
     # paths
     def full_alias(self):
@@ -423,6 +480,8 @@ class Config:
 
     def all_runs(self):
         runs = {self.FULL_RUN_ID: self.full_run()}
+        if self.MAIN_EPOCHS > 0:
+            runs[self.MAIN_RUN_ID] = self.main_run()
         for g in self.ablation_groups().values():
             for r in g:
                 runs.setdefault(r['run_id'], r)
