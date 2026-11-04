@@ -112,6 +112,7 @@ class Config:
         'lol':      'soumikrakshit/lol-dataset',               # LOL eval15
         'live1':    'nikshko/live-1',                          # LIVE1 references (29 bmp)
         'legacy_raining': 'adeshpal/image-deraining',          # audit only: the "raining" category of the submitted pool
+        'cdd11':    'haohoangofficial/cdd11-full',             # CDD-11 (OneRestore, ECCV 2024): 1,183 clean x 11 degradation combinations
         'snow_test_l': 'suzukimio/allweather-testing',         # Snow100K-L official test set (16,801 pairs, AllWeather_Testing/Snow100K-L);
                                                                # names and byte sizes identical to the official archive
     }
@@ -125,6 +126,17 @@ class Config:
     # Checked against the official archive listings: every file has the official name and byte size.
     HF_ZIP_SOURCES = {
         'snow100k_hf': dict(repo='fancongyi/snow100k', file='Snow100K_ConvIR.zip'),
+        # DIV2K training HR images (800 PNG, 2K): clean images of the synthetic categories (same size as the
+        # official ETH archive DIV2K_train_HR.zip, 3,530,603,713 bytes)
+        'div2k': dict(repo='deepinv/DIV2K', file='DIV2K_train_HR.zip'),
+    }
+    # Pairs extracted one by one from a remote zip (HTTP range requests): a seeded subset of an official split.
+    # RSBlur (Rim et al., ECCV 2022): real hand-held camera shake recorded with a beam-splitter rig, sharp
+    # reference aligned with the blurred image (1917x1199).  The real counterpart of Koehler's camera shake;
+    # official training list (8,878 pairs, 19 scenes), never its val/test lists.  ~6.6 MB per pair.
+    HF_REMOTE_ZIP_SOURCES = {
+        'rsblur': dict(repo='rimchang/RSBlur', file='RSBlur.zip', n_pairs=1000, seed=2026,
+                       list_url='https://raw.githubusercontent.com/rimchang/RSBlur/main/datalist/RSBlur/RSBlur_real_train.txt'),
     }
     # names of the Snow100K-S / -M official test images contained in test2000 (zlib + base64)
     SNOW_LEVEL_NAMES = {
@@ -200,6 +212,9 @@ class Config:
     # Hugging Face parquet mirrors.  DPDD test (76 pairs, 1680x1120, original file names, combined image
     # 'source' = inputC, 'target'); the official Google-Drive file (DPDD_GDOWN_ID) is the fallback.
     HF_PARQUET_SOURCES = {
+        # DPDD training split (350 pairs, combined image 'source' = train_c/source, 'target' = train_c/target)
+        'dpdd_train': dict(repo='JacobLinCool/DPDD', files=[f'combined/train-{i:05d}-of-00012.parquet' for i in range(12)],
+                           columns={'source': 'train/inputC', 'target': 'train/target'}, key_column='source'),
         'dpdd_test': dict(repo='JacobLinCool/DPDD', files=[f'combined/test-0000{i}-of-00003.parquet' for i in range(3)],
                           columns={'source': 'test/inputC', 'target': 'test/target'}, key_column='source'),
     }
@@ -245,12 +260,22 @@ class Config:
         # mean of homographies K R(t) K^-1 along a 6-DOF rotational hand-shake trajectory, integrated in linear
         # light, non-uniform over a virtual full frame, mild sensor noise / JPEG.  Random trajectories (no
         # Koehler image or trajectory), clean images = GoPro training sharp frames.
-        'camera_shake': dict(family='blur', synth='camera_shake',
-                             input=('dblur', 'DBlur/Gopro/train/sharp'), gt=('dblur', 'DBlur/Gopro/train/sharp')),
+        'camera_shake': dict(family='blur', synth='camera_shake', repeat=3,
+                             input=('div2k', 'DIV2K_train_HR'), gt=('div2k', 'DIV2K_train_HR')),
+        # Real counterpart: RSBlur real hand-held camera shake (1,000 pairs of the official training split)
+        'rsblur':     dict(family='blur', root=('rsblur', 'RSBlur'), input_glob='*/*/real_blur/real_blur.png',
+                           gt_replace=('path', 'real_blur/real_blur.png', 'gt/gt_sharp.png'), repeat=2),
+        # CDD-11 training split: low light, haze, rain, snow and their 7 combinations on the same 1,183 scenes
+        'cdd11':      dict(family='mixed', root=('cdd11', 'CDD-11_train/CDD-11_train'), input_glob='*/*.png',
+                           gt_replace=('sibling', 'clear')),
+        # LOL our485 (low light) and DPDD training split (defocus): the leakage audit removes the our485 captures that
+        # duplicate an eval15 scene, so LOL eval15 stays scene-disjoint
+        'lol':        dict(family='lowlight', input=('lol', 'lol_dataset/our485/low'), gt=('lol', 'lol_dataset/our485/high')),
+        'dpdd':       dict(family='defocus', input=('dpdd_train', 'train/inputC'), gt=('dpdd_train', 'train/target'), repeat=2),
         # Composite degradations: 1-3 of haze, rain streaks, snow, defocus, camera shake, low light,
         # Poisson-Gaussian noise, JPEG, applied in physical order to the same image.
-        'composite':  dict(family='mixed', synth='composite', repeat=2,
-                           input=('reside6k', 'RESIDE-6K/train/GT'), gt=('reside6k', 'RESIDE-6K/train/GT'),
+        'composite':  dict(family='mixed', synth='composite', repeat=3,
+                           input=('div2k', 'DIV2K_train_HR'), gt=('div2k', 'DIV2K_train_HR'),
                            exclude_overlap_with=['gopro', 'hide', 'textocr', 'kohler', 'rain100l', 'rain100h', 'reside6k',
                                                  'snow100k_l', 'snow100k_s', 'snow100k_m', 'cbsd68_g25', 'live1_q10', 'lol', 'dpdd']),
     }
@@ -266,6 +291,10 @@ class Config:
     # the per-category cap is applied.  Screening: correlation of 24x24 grey thumbnails > OVERLAP_THRESHOLD,
     # confirmation: 64x64 thumbnails > OVERLAP_CONFIRM and aspect ratio within 5 %.
     EXCLUDE_TEST_OVERLAP = True
+    # 'all': every training category is compared with the clean images of EVERY benchmark, not only those of its
+    # family (the JRDR rain training backgrounds are 300 BSDS500 images and include the 68 CBSD68 test images
+    # pixel for pixel: a family-only audit kept 528 such pairs).  'family': same-family benchmarks only.
+    LEAKAGE_SCOPE = 'all'
     OVERLAP_THRESHOLD = 0.97
     OVERLAP_CONFIRM = 0.95
     # Pair validation (audit stage): per category / benchmark, VALIDATE_SAMPLES pairs are checked for

@@ -129,9 +129,94 @@ def _download_hf_zip(cfg, key):
     return dest
 
 
+class _HTTPRangeFile(io.RawIOBase):
+    """Seekable read-only view of a remote file through HTTP range requests (zipfile reads the central
+    directory and single members of a 100 GB archive without downloading it)."""
+
+    def __init__(self, url):
+        import urllib.request
+        self._ur = urllib.request
+        r = urllib.request.urlopen(urllib.request.Request(url, method='HEAD', headers={'User-Agent': 'kasirnet'}), timeout=120)
+        self.url, self.size, self.pos = r.geturl(), int(r.headers['Content-Length']), 0
+
+    def seekable(self):
+        return True
+
+    def readable(self):
+        return True
+
+    def tell(self):
+        return self.pos
+
+    def seek(self, o, whence=0):
+        self.pos = o if whence == 0 else self.pos + o if whence == 1 else self.size + o
+        return self.pos
+
+    def read(self, n=-1):
+        n = self.size - self.pos if n is None or n < 0 else n
+        if n == 0 or self.pos >= self.size:
+            return b''
+        end = min(self.pos + n, self.size) - 1
+        for attempt in range(5):
+            try:
+                req = self._ur.Request(self.url, headers={'Range': f'bytes={self.pos}-{end}', 'User-Agent': 'kasirnet'})
+                b = self._ur.urlopen(req, timeout=300).read()
+                break
+            except Exception:
+                if attempt == 4:
+                    raise
+                time.sleep(2 ** attempt)
+        self.pos += len(b)
+        return b
+
+    def readinto(self, buf):
+        d = self.read(len(buf))
+        buf[:len(d)] = d
+        return len(d)
+
+
+def _download_hf_remote_zip(cfg, key):
+    """A seeded subset of the pairs listed in an official split file, extracted member by member from a
+    remote zip (Hugging Face) with HTTP range requests (e.g. 1,000 RSBlur training pairs out of 115 GB)."""
+    import urllib.request
+    import zipfile
+    from concurrent.futures import ThreadPoolExecutor
+    spec = cfg.HF_REMOTE_ZIP_SOURCES[key]
+    dest = os.path.join(cfg.DATA_ROOT, key)
+    if os.path.exists(_done(dest)):
+        return dest
+    lines = urllib.request.urlopen(spec['list_url'], timeout=120).read().decode().split('\n')
+    pairs = sorted({tuple(ln.split()) for ln in lines if len(ln.split()) == 2})
+    pairs = random.Random(spec.get('seed', 2026)).sample(pairs, min(spec['n_pairs'], len(pairs)))
+    members = sorted({m for p in pairs for m in p})
+    url = f'https://huggingface.co/datasets/{spec["repo"]}/resolve/main/{spec["file"]}'
+    print(f'[data] {key}: {len(pairs)} pairs ({len(members)} files) from {url} by range requests')
+
+    def worker(chunk):
+        z = zipfile.ZipFile(io.BufferedReader(_HTTPRangeFile(url), buffer_size=1 << 22))
+        for m in chunk:
+            out = os.path.join(dest, m)
+            if os.path.exists(out):
+                continue
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+            with open(out + '.part', 'wb') as fh:
+                fh.write(z.read(m))
+            os.replace(out + '.part', out)
+        return len(chunk)
+
+    nw = spec.get('workers', 16)
+    with ThreadPoolExecutor(nw) as ex:
+        done = sum(ex.map(worker, [members[i::nw] for i in range(nw)]))
+    print(f'[data] {key}: {done} files written to {dest}')
+    open(_done(dest), 'w').write('ok')
+    return dest
+
+
 def download_source(cfg, key):
     if key in cfg.HF_ZIP_SOURCES:
         return _download_hf_zip(cfg, key)
+    if key in getattr(cfg, 'HF_REMOTE_ZIP_SOURCES', {}):
+        return _download_hf_remote_zip(cfg, key)
     if key in cfg.KAGGLE_SOURCES:
         import kagglehub
         return kagglehub.dataset_download(cfg.KAGGLE_SOURCES[key])
@@ -192,7 +277,8 @@ class DatasetCache:
             return False
         if getattr(self.cfg, 'DATA_CACHE_SOURCES', 'fragile') == 'all':
             return True
-        return key in self.cfg.GDOWN_SOURCES or key in self.cfg.HF_PARQUET_SOURCES or key in self.cfg.HF_ZIP_SOURCES
+        return (key in self.cfg.GDOWN_SOURCES or key in self.cfg.HF_PARQUET_SOURCES or key in self.cfg.HF_ZIP_SOURCES
+                or key in getattr(self.cfg, 'HF_REMOTE_ZIP_SOURCES', {}))
 
     def inventory(self, keys):
         """Print what the Drive cache holds (helps to see a cache lost to a full Drive)."""
@@ -353,13 +439,26 @@ def pair_files(input_dir, gt_dir, match='stem', include=None):
 def pair_by_replace(root, input_glob, gt_replace):
     if not os.path.isdir(root):
         raise FileNotFoundError(f'directory {root} does not exist')
-    old, new = gt_replace
+    """gt_replace: (old, new) replaced in the file name | ('path', old, new) replaced in the path relative to
+    root (key = that relative path) | ('sibling', dir) same file name in the sibling folder `dir` (inputs in
+    `dir` itself are skipped; key = '<input folder>/<stem>')."""
     ins = sorted(glob.glob(os.path.join(root, input_glob), recursive=True))
     pairs, missing = [], 0
     for f in ins:
-        g = os.path.join(os.path.dirname(f), os.path.basename(f).replace(old, new))
-        if os.path.exists(g):
-            pairs.append((f, g, os.path.splitext(os.path.basename(f))[0]))
+        rel = os.path.relpath(f, root)
+        if gt_replace[0] == 'path':
+            g, key = os.path.join(root, rel.replace(gt_replace[1], gt_replace[2])), os.path.splitext(rel)[0]
+        elif gt_replace[0] == 'sibling':
+            parent = os.path.basename(os.path.dirname(f))
+            if parent == gt_replace[1]:
+                continue
+            g = os.path.join(os.path.dirname(os.path.dirname(f)), gt_replace[1], os.path.basename(f))
+            key = f'{parent}/{os.path.splitext(os.path.basename(f))[0]}'
+        else:
+            g = os.path.join(os.path.dirname(f), os.path.basename(f).replace(gt_replace[0], gt_replace[1]))
+            key = os.path.splitext(os.path.basename(f))[0]
+        if os.path.exists(g) and os.path.abspath(g) != os.path.abspath(f):
+            pairs.append((f, g, key))
         else:
             missing += 1
     if not pairs:
@@ -486,7 +585,7 @@ class LeakageAuditor:
 
 def manifest_signature(cfg):
     return hashlib.md5(json.dumps([cfg.train_categories(), cfg.MAX_PER_CATEGORY, cfg.VAL_PER_CATEGORY, cfg.DATA_SUBSET_SEED,
-                                   cfg.EXCLUDE_TEST_OVERLAP, cfg.OVERLAP_THRESHOLD, cfg.OVERLAP_CONFIRM, cfg.KOHLER_PROTOCOL,
+                                   cfg.EXCLUDE_TEST_OVERLAP, cfg.OVERLAP_THRESHOLD, cfg.OVERLAP_CONFIRM, cfg.KOHLER_PROTOCOL, cfg.LEAKAGE_SCOPE,
                                    sorted(overlap_benchmarks(cfg).items())],
                                   sort_keys=True, default=str).encode()).hexdigest()
 
@@ -555,8 +654,8 @@ def build_training_manifest(cfg, roots, force=False):
         rng.shuffle(pairs)
         n_val = min(cfg.VAL_PER_CATEGORY, max(1, len(pairs) // 10)) if len(pairs) >= 5 else 0
         need = n_val + cfg.MAX_PER_CATEGORY
-        checks = sorted(set(spec.get('exclude_overlap_with', [])) | set(fam_bench.get(spec['family'], []))) \
-            if cfg.EXCLUDE_TEST_OVERLAP else []
+        scope = sorted({b for v in fam_bench.values() for b in v}) if cfg.LEAKAGE_SCOPE == 'all' else fam_bench.get(spec['family'], [])
+        checks = sorted(set(spec.get('exclude_overlap_with', [])) | set(scope)) if cfg.EXCLUDE_TEST_OVERLAP else []
         for b in checks:
             if b not in bench_gts:
                 try:

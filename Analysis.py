@@ -1000,10 +1000,16 @@ def main_tables(cfg, run_id):
     save_table(rows, 'table4_5_main_results', cfg, digits=dict(n=0, psnr=2, ssim=3, lpips=3, dists=3, psnr_y=2, ssim_y=3,
                                                               input_psnr=2, input_ssim=3, gt_resized=0))
     zs = []
+    cats = cfg.train_categories()
     for b in ('live1_q10', 'lol', 'dpdd'):
         e = read_json(os.path.join(cfg.run_dir(run_id), 'eval', b, 'summary.json'))
         if e:
-            zs.append(dict(benchmark=b, n=e['n_images'], input_psnr=e['input_psnr'], input_ssim=e['input_ssim'], psnr=e['psnr'], ssim=e['ssim']))
+            fam = cfg.benchmarks()[b]['family']
+            real = sorted(n for n, c in cats.items() if c['family'] == fam and not c.get('synth'))
+            synth = sorted(n for n, c in cats.items() if c.get('synth') == 'composite' and fam in ('jpeg', 'lowlight', 'defocus'))
+            exposure = ('real pairs: ' + ', '.join(real)) if real else ('synthetic only: ' + ', '.join(synth)) if synth else 'zero-shot'
+            zs.append(dict(benchmark=b, n=e['n_images'], training_exposure=exposure, input_psnr=e['input_psnr'],
+                           input_ssim=e['input_ssim'], psnr=e['psnr'], ssim=e['ssim']))
     save_table(zs, 'table14_zero_shot', cfg, digits=dict(n=0, input_psnr=2, input_ssim=3, psnr=2, ssim=3))
     return rows, zs
 
