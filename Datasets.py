@@ -1022,8 +1022,9 @@ def synth_degrade(clean, kind, rng, out=256, types=SYNTH_TYPES):
     gt = clean[:, m:m + out, m:m + out]
     g = _gen(rng)
     if kind == 'camera_shake':
-        ops = ['shake', 'noise'] + (['jpeg'] if rng.random() < 0.5 else [])      # Koehler-like: low ISO, mild noise
-        params = dict(noise=float(rng.uniform(0.0, 0.006)), jpeg=int(rng.integers(75, 96)))
+        # blur only + the mild sensor noise of any real photograph (no JPEG: JPEG is an unseen degradation, TODO-17)
+        ops = ['shake', 'noise']
+        params = dict(noise=float(rng.uniform(0.0, 0.006)), jpeg=None)
     else:
         pool = [t for t in types]
         k = int(rng.choice([1, 2, 3], p=[0.25, 0.45, 0.30]))

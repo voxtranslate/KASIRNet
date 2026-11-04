@@ -112,7 +112,6 @@ class Config:
         'lol':      'soumikrakshit/lol-dataset',               # LOL eval15
         'live1':    'nikshko/live-1',                          # LIVE1 references (29 bmp)
         'legacy_raining': 'adeshpal/image-deraining',          # audit only: the "raining" category of the submitted pool
-        'cdd11':    'haohoangofficial/cdd11-full',             # CDD-11 (OneRestore, ECCV 2024): 1,183 clean x 11 degradation combinations
         'snow_test_l': 'suzukimio/allweather-testing',         # Snow100K-L official test set (16,801 pairs, AllWeather_Testing/Snow100K-L);
                                                                # names and byte sizes identical to the official archive
     }
@@ -212,9 +211,6 @@ class Config:
     # Hugging Face parquet mirrors.  DPDD test (76 pairs, 1680x1120, original file names, combined image
     # 'source' = inputC, 'target'); the official Google-Drive file (DPDD_GDOWN_ID) is the fallback.
     HF_PARQUET_SOURCES = {
-        # DPDD training split (350 pairs, combined image 'source' = train_c/source, 'target' = train_c/target)
-        'dpdd_train': dict(repo='JacobLinCool/DPDD', files=[f'combined/train-{i:05d}-of-00012.parquet' for i in range(12)],
-                           columns={'source': 'train/inputC', 'target': 'train/target'}, key_column='source'),
         'dpdd_test': dict(repo='JacobLinCool/DPDD', files=[f'combined/test-0000{i}-of-00003.parquet' for i in range(3)],
                           columns={'source': 'test/inputC', 'target': 'test/target'}, key_column='source'),
     }
@@ -265,19 +261,9 @@ class Config:
         # Real counterpart: RSBlur real hand-held camera shake (1,000 pairs of the official training split)
         'rsblur':     dict(family='blur', root=('rsblur', 'RSBlur'), input_glob='*/*/real_blur/real_blur.png',
                            gt_replace=('path', 'real_blur/real_blur.png', 'gt/gt_sharp.png'), repeat=2),
-        # CDD-11 training split: low light, haze, rain, snow and their 7 combinations on the same 1,183 scenes
-        'cdd11':      dict(family='mixed', root=('cdd11', 'CDD-11_train/CDD-11_train'), input_glob='*/*.png',
-                           gt_replace=('sibling', 'clear')),
-        # LOL our485 (low light) and DPDD training split (defocus): the leakage audit removes the our485 captures that
-        # duplicate an eval15 scene, so LOL eval15 stays scene-disjoint
-        'lol':        dict(family='lowlight', input=('lol', 'lol_dataset/our485/low'), gt=('lol', 'lol_dataset/our485/high')),
-        'dpdd':       dict(family='defocus', input=('dpdd_train', 'train/inputC'), gt=('dpdd_train', 'train/target'), repeat=2),
-        # Composite degradations: 1-3 of haze, rain streaks, snow, defocus, camera shake, low light,
-        # Poisson-Gaussian noise, JPEG, applied in physical order to the same image.
-        'composite':  dict(family='mixed', synth='composite', repeat=3,
-                           input=('div2k', 'DIV2K_train_HR'), gt=('div2k', 'DIV2K_train_HR'),
-                           exclude_overlap_with=['gopro', 'hide', 'textocr', 'kohler', 'rain100l', 'rain100h', 'reside6k',
-                                                 'snow100k_l', 'snow100k_s', 'snow100k_m', 'cbsd68_g25', 'live1_q10', 'lol', 'dpdd']),
+        # NOT in the pool: low light, defocus, JPEG and mixed degradations (LOL, DPDD, CDD-11, synthetic
+        # composites).  They are the unseen degradations of TODO-17 (LIVE1 JPEG, LOL, DPDD) and the unseen
+        # combinations of TODO-16 (mixed sets): training covers only the article's blur, rain, haze, snow, noise.
     }
     # Koehler has no official training split.  'test_only' (default, standard protocol):
     # all 48 images are a test set and none is trained on.  'scene_split': scenes 1-3 are a
