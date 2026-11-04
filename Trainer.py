@@ -15,6 +15,7 @@
 import os
 import csv
 import json
+import hashlib
 import math
 import time
 import uuid
@@ -30,7 +31,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Sampler
 
-from Datasets import UniversalRestorationDataset  # nb:skip
+from Datasets import UniversalRestorationDataset, manifest_signature  # nb:skip
 from Model import KASIRNet, component_parameter_table  # nb:skip
 from Loss import OmniRestorationLoss  # nb:skip
 from metrics import MetricSuite, psnr_torch  # nb:skip
@@ -145,6 +146,39 @@ def load_weights(model, path, device='cpu'):
 
 
 LOSS_CALIBRATION_VERSION = 1
+TRAIN_CODE_VERSION = 3   # bumped when the training computation changes (3: calibrated loss, ortho FFT, eval-mode loss nets, no train clamp)
+
+
+def recipe_signature(cfg, run):
+    """Everything that defines what a run learns: training pool, budget, optimiser, schedule, model, loss.
+    A stored run (complete or paused) with another signature is superseded and trained again."""
+    blob = [manifest_signature(cfg), run['epochs'], float(run.get('lr', cfg.LR)), int(run.get('warmup', cfg.WARMUP_ITERS)),
+            run.get('init_from'), run['seed'], cfg.model_kwargs(run), cfg.loss_weights(run), cfg.LOSS_CALIBRATION,
+            LOSS_CALIBRATION_VERSION, cfg.BATCH_SIZE, cfg.PATCH_SIZE, list(cfg.BETAS), cfg.WEIGHT_DECAY, cfg.ETA_MIN,
+            cfg.GRAD_CLIP, cfg.AMP, cfg.AMP_DTYPE, TRAIN_CODE_VERSION]
+    return hashlib.md5(json.dumps(blob, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def supersede_if_stale(cfg, run):
+    """Moves runs/<id> and checkpoints/<id> aside (<id>__superseded_N, nothing deleted) when they were produced
+    with another recipe, e.g. by an earlier version of this notebook.  Returns True if something was moved."""
+    rid = run['run_id']
+    rdir, cdir = cfg.run_dir(rid), cfg.ckpt_dir(rid)
+    rec = read_json(os.path.join(rdir, 'run.json'), {})
+    has_ck = os.path.isdir(cdir) and any(f.endswith('.pth') for f in os.listdir(cdir))
+    if not rec and not has_ck:
+        return False
+    if rec.get('recipe_signature') == recipe_signature(cfg, run):
+        return False
+    k = 1
+    while os.path.exists(f'{rdir}__superseded_{k}') or os.path.exists(f'{cdir}__superseded_{k}'):
+        k += 1
+    for d in (rdir, cdir):
+        if os.path.exists(d):
+            os.replace(d, f'{d}__superseded_{k}')
+    print(f'[{rid}] !! stored run was trained with another recipe (training pool, budget, learning rate, loss or code '
+          f'version): moved to *__superseded_{k}; it is trained again with the current recipe')
+    return True
 
 
 def loss_scales(cfg, manifest, device):
@@ -186,6 +220,8 @@ class Trainer:
     def __init__(self, cfg, run, manifest, device=None):
         self.cfg, self.run = cfg, run
         self.run_id = run['run_id']
+        supersede_if_stale(cfg, run)
+        self.recipe = recipe_signature(cfg, run)
         self.device = torch.device(device or (cfg.DEVICE if torch.cuda.is_available() else 'cpu'))
         self.ckdir, self.rundir = cfg.ckpt_dir(self.run_id), cfg.run_dir(self.run_id)
         os.makedirs(self.ckdir, exist_ok=True)
@@ -357,6 +393,7 @@ class Trainer:
     def _write_record(self, status):
         rec = dict(self.record)
         rec.update(run_id=self.run_id, group=self.run['group'], seed=self.run['seed'], status=status,
+                   recipe_signature=self.recipe,
                    budget=dict(epochs=self.run['epochs'], iters_per_epoch=self.ipe, total_iters=self.total_iters,
                                iterations_done=self.iteration, batch_size=self.cfg.BATCH_SIZE, patch=self.cfg.PATCH_SIZE,
                                samples_seen=self.iteration * self.cfg.BATCH_SIZE),

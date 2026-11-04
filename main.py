@@ -13,7 +13,7 @@ from Config import Config  # nb:skip
 from Datasets import (resolve_sources, spec_sources, build_training_manifest, BenchmarkDataset, DatasetCache,  # nb:skip
                       manifest_is_current, overlap_benchmarks, manifest_used_files, validate_data, resolve_path,  # nb:skip
                       benchmark_files, validation_signature)  # nb:skip
-from Trainer import Trainer, read_json, write_json, try_lock, release_lock  # nb:skip
+from Trainer import Trainer, read_json, write_json, try_lock, release_lock, recipe_signature  # nb:skip
 from Inferencer import Evaluator, KASIRNetInferencer, select_inference_protocol  # nb:skip
 from metrics import MetricSuite  # nb:skip
 from Competitors import competitor_plan, competitor_folders, generate_competitor_outputs  # nb:skip
@@ -188,12 +188,12 @@ class Experiment:
         rec = read_json(os.path.join(cfg.run_dir(rid), 'run.json'), {})
         out_dir = cfg.analysis_dir('inference_protocol')
         key = [cfg.INFERENCE_CANDIDATES, list(cfg.INFERENCE_SELECT_MAX_SIZE), cfg.INFERENCE_SELECT_MIN_GAIN, rid,
-               rec.get('selection', {}).get('selected')]
+               rec.get('selection', {}).get('selected'), rec.get('recipe_signature')]
         sel = read_json(os.path.join(out_dir, 'selection.json'), {})
         if sel.get('key') == key:
             self._protocol = sel['selected']
             return self._protocol
-        if rec.get('status') != 'complete':
+        if not self.complete(rid):
             return None            # not selectable yet: evaluations wait (evaluate_many defers them)
         model = Evaluator(cfg, self._roots, self.device).load_run_model(cfg.all_runs()[rid])
         sel = select_inference_protocol(cfg, model, self.manifest()['val'], self.device, out_dir)
@@ -205,7 +205,10 @@ class Experiment:
         return self._protocol
 
     def complete(self, run_id):
-        return read_json(os.path.join(self.cfg.run_dir(run_id), 'run.json'), {}).get('status') == 'complete'
+        """Complete AND trained with the current recipe (a run of an earlier notebook version does not count)."""
+        rec = read_json(os.path.join(self.cfg.run_dir(run_id), 'run.json'), {})
+        run = self.cfg.all_runs().get(self.cfg.resolve_run(run_id)) or self.cfg.all_runs().get(run_id)
+        return rec.get('status') == 'complete' and run is not None and rec.get('recipe_signature') == recipe_signature(self.cfg, run)
 
     def model(self, run_id):
         return self.evaluator().load_run_model(self.cfg.all_runs()[run_id])
