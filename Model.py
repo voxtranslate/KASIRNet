@@ -52,10 +52,10 @@ class MesgridCoordinateEmbedder(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
-        y_coords = torch.linspace(-1, 1, H, device=x.device, dtype=x.dtype).view(1, 1, H, 1).expand(B, 1, H, W)
-        x_coords = torch.linspace(-1, 1, W, device=x.device, dtype=x.dtype).view(1, 1, 1, W).expand(B, 1, H, W)
+        y_coords = torch.linspace(-1, 1, H, device=x.device, dtype=x.dtype).view(1, 1, H, 1).expand(1, 1, H, W)
+        x_coords = torch.linspace(-1, 1, W, device=x.device, dtype=x.dtype).view(1, 1, 1, W).expand(1, 1, H, W)
         coords = torch.cat([x_coords, y_coords], dim=1)
-        return self.embed(coords)
+        return self.embed(coords).expand(B, -1, -1, -1)    # identical for every sample: computed once
 
 
 class WindowAttention(nn.Module):
@@ -339,6 +339,7 @@ class _FrozenExtractor(nn.Module):
             param.requires_grad = False
         self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+        self.train(False)            # eval mode from construction on (modules are built in training mode)
 
     def train(self, mode=True):  # BatchNorm of ResNet must never switch to batch statistics
         return super().train(False)
@@ -552,8 +553,9 @@ class SFTLayer(nn.Module):
         self.sft_shift = nn.Conv2d(prompt_dim, in_channels, 1)
 
     def forward(self, x, prompt_emb):
-        prompt = prompt_emb.view(prompt_emb.size(0), prompt_emb.size(1), 1, 1)
-        prompt = prompt.expand(-1, -1, x.size(2), x.size(3))
+        # gamma(p), beta(p) are spatially constant: the 1x1 convs are applied once to the B x 256 x 1 x 1
+        # descriptor and broadcast (identical result to applying them on the H x W broadcast descriptor)
+        prompt = prompt_emb.view(prompt_emb.size(0), prompt_emb.size(1), 1, 1).to(x.dtype)
         scale = self.sft_scale(prompt)
         shift = self.sft_shift(prompt)
         return x * (scale + 1) + shift
@@ -635,6 +637,9 @@ class KASIRNet(nn.Module):
         self.use_sim, self.use_prompt, self.num_scales = o['use_sim'], o['use_prompt'], o['num_scales']
         assert self.num_scales in (3, 4), 'num_scales must be 3 or 4'
         self.prompt_dim = prompt_dim
+        # input padding: a multiple of window_size x 2^num_scales, so that no SCWAM layer pads internally
+        # (internal zero padding is normalised to the LayerNorm bias and the cyclic shift wraps into it)
+        self.pad_multiple = o.get('window_size', 8) * 2 ** self.num_scales
 
         if self.use_sim:
             ext = SEMANTIC_EXTRACTORS[o['extractor']](pretrained=o['extractor_pretrained'])
@@ -688,8 +693,9 @@ class KASIRNet(nn.Module):
 
     def check_image_size(self, x):
         _, _, h, w = x.size()
-        mod_pad_h = (16 - h % 16) % 16
-        mod_pad_w = (16 - w % 16) % 16
+        m = getattr(self, 'pad_multiple', 16)
+        mod_pad_h = (m - h % m) % m
+        mod_pad_w = (m - w % m) % m
         x = torch.nn.functional.pad(x, (0, mod_pad_w, 0, mod_pad_h), mode='replicate')
         return x, h, w
 
@@ -729,7 +735,9 @@ class KASIRNet(nn.Module):
 
         out = self.tail(d1)
         out = out + x_padded
-        out = out[:, :, :H_orig, :W_orig].clamp(0, 1)
+        out = out[:, :, :H_orig, :W_orig]
+        if not self.training:   # clamping during training would zero the gradient of every overshooting pixel
+            out = out.clamp(0, 1)
 
         return out, prompt_emb
 

@@ -35,7 +35,7 @@ from Model import KASIRNet, component_parameter_table  # nb:skip
 from Loss import OmniRestorationLoss  # nb:skip
 from metrics import MetricSuite, psnr_torch  # nb:skip
 
-FAMILIES = ['blur', 'rain', 'haze', 'snow', 'noise', 'mixed']
+FAMILIES = ['blur', 'rain', 'haze', 'snow', 'noise', 'mixed', 'lowlight', 'defocus', 'jpeg']
 
 
 def seed_everything(seed, deterministic=False):
@@ -144,6 +144,44 @@ def load_weights(model, path, device='cpu'):
     return ck
 
 
+LOSS_CALIBRATION_VERSION = 1
+
+
+def loss_scales(cfg, manifest, device):
+    """Fixed per-term scales of the loss (Loss.py, 'Calibrated weights'): s_k = g_pix / g_k with g_k the mean
+    norm of dL_k/d(pred) at pred = degraded input over the held-out validation patches.  Model-independent,
+    computed once per training pool and shared by every run (data_manifest/loss_calibration.json)."""
+    terms = OmniRestorationLoss.TERMS
+    if not cfg.LOSS_CALIBRATION:
+        return {k: 1.0 for k in terms}
+    path = os.path.join(cfg.manifest_dir, 'loss_calibration.json')
+    key = [manifest['signature'], LOSS_CALIBRATION_VERSION, cfg.PATCH_SIZE]
+    rec = read_json(path, {})
+    if rec.get('key') == key:
+        return rec['scales']
+    crit = OmniRestorationLoss({k: 1.0 for k in terms}).to(device)
+    ds = UniversalRestorationDataset(manifest['val'], cfg.PATCH_SIZE, False, FAMILIES)
+    norms = {k: [] for k in terms}
+    for b in DataLoader(ds, batch_size=16, shuffle=False, num_workers=min(4, cfg.NUM_WORKERS)):
+        x, y = b['input'].to(device), b['gt'].to(device)
+        for k in terms:
+            p = x.clone().requires_grad_(True)
+            val = crit.terms(p, y, only={k})[k]
+            g, = torch.autograd.grad(val, p)
+            norms[k].append(float(g.norm()))
+    g = {k: float(np.mean(v)) for k, v in norms.items()}
+    scales = {k: (g['pix'] / g[k] if g[k] > 0 else 1.0) for k in terms}
+    w = cfg.LOSS_WEIGHTS
+    share = {k: w[k] / sum(w.values()) for k in terms}
+    raw = {k: w[k] * g[k] / sum(w[j] * g[j] for j in terms) for k in terms}
+    write_json(dict(key=key, grad_norm_at_input=g, scales=scales, gradient_share_uncalibrated=raw,
+                    gradient_share_calibrated=share, n_patches=len(ds)), path)
+    print('[loss] calibrated scales ' + ', '.join(f'{k} {v:.3g}' for k, v in scales.items()) +
+          ' | gradient share without calibration ' + ', '.join(f'{k} {100 * v:.0f}%' for k, v in raw.items()))
+    del crit
+    return scales
+
+
 class Trainer:
     def __init__(self, cfg, run, manifest, device=None):
         self.cfg, self.run = cfg, run
@@ -168,7 +206,9 @@ class Trainer:
         self.model = build_model(cfg, run).to(self.device)
         self.amp_dtype = torch.bfloat16 if cfg.AMP_DTYPE == 'bfloat16' else torch.float16
         self.use_amp = bool(cfg.AMP and self.device.type == 'cuda')
-        self.criterion = OmniRestorationLoss(cfg.loss_weights(run), amp=self.use_amp, amp_dtype=self.amp_dtype).to(self.device)
+        self.loss_scales = loss_scales(cfg, manifest, self.device)
+        self.criterion = OmniRestorationLoss(cfg.loss_weights(run), amp=self.use_amp, amp_dtype=self.amp_dtype,
+                                             scales=self.loss_scales).to(self.device).eval()
         params = [p for p in self.model.parameters() if p.requires_grad]
         self.lr = float(run.get('lr', cfg.LR))
         self.warmup = int(run.get('warmup', cfg.WARMUP_ITERS))
@@ -326,6 +366,7 @@ class Trainer:
                                               f'cosine per iteration, {self.lr} -> {self.cfg.ETA_MIN}', grad_clip=self.cfg.GRAD_CLIP,
                                      amp=self.use_amp, amp_dtype=str(self.amp_dtype), skipped_nonfinite_steps=self.skipped_steps),
                    model_flags=self.cfg.model_kwargs(self.run), loss_weights=self.cfg.loss_weights(self.run),
+                   loss_scales=self.loss_scales,
                    parameters_M=component_parameter_table(self.model),
                    data=dict(n_train_items=len(self.manifest['train']), n_train_samples_per_epoch=len(self.train_ds),
                              n_val=len(self.val_ds), manifest_signature=self.manifest['signature'],

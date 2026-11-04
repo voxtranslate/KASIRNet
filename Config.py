@@ -363,6 +363,7 @@ class Config:
     LOG_EVERY_ITERS = 100
     MODEL_SELECTION = 'best_val'  # 'best_val' (held-out split of the training pool, never a test set) or 'last'
     LOSS_WEIGHTS = dict(pix=5.0, fft=0.5, perc=1.0, ssim=1.0, id=1.0, edge=0.5)
+    LOSS_CALIBRATION = True       # weights act on scale-calibrated terms (Loss.py); False = raw terms
     SEED = 1
 
     # ------------------------------------------------------------------ model
