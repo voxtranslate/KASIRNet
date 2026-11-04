@@ -71,7 +71,7 @@ Outputs used by the manuscript (all under `OUTPUT_ROOT/tables`, CSV + LaTeX rows
 
 | reviewer item | table / file |
 |---|---|
-| Tables 4–5, ablation reference (mean of GoPro, Rain100L, SIDD) | `table4_5_main_results` |
+| Tables 4–5 (final model `KASIRNet_main`) | `table4_5_main_results`; the ablation reference (mean of GoPro, Rain100L, SIDD of `KASIRNet_full`, 150 epochs) is the first row of `table6_component_ablation` |
 | TODO-02 Rain100H | `table4_5_main_results` (row `rain100h`) |
 | TODO-06 Figs. S1/S2 | `analysis/figures/FigS1_rain100l.*`, `FigS2_snow100k_l.*` (images at the 25th/50th/75th percentile of PSNR gain) |
 | TODO-09 A / B | `table8_sim_severity`, `table8_feature_stability`, `table8_extractors` |

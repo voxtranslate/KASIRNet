@@ -35,7 +35,7 @@ from Model import (KASIRNet, SpectralResonanceBlock, PlainConvBlock, WindowAtten
 from Loss import VGGFeatureExtractor, IdentityFeature  # nb:skip
 from metrics import PROTOCOL, ssim_y  # nb:skip
 from Trainer import build_model, load_weights, read_json, write_json, environment_info  # nb:skip
-from Inferencer import read_rows, write_rows  # nb:skip
+from Inferencer import read_rows, write_rows, run_model  # nb:skip
 
 
 # ==========================================
@@ -300,21 +300,23 @@ def count_macs(model, size, device):
         WindowAttention.use_fused = True
 
 
-def profile_latency(model, size, device, dtype, warmup, repeats):
+def profile_latency(model, size, device, dtype, warmup, repeats, protocol='full'):
+    """Latency / peak memory of restoring one image under an inference protocol (Inferencer.run_model)."""
     x = torch.rand(1, 3, *size, device=device)
+    fwd = lambda t: run_model(model, t, protocol)
     amp = dtype == 'fp16' and device.type == 'cuda'
     if device.type == 'cuda':
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
     with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
         for _ in range(warmup):
-            model(x)
+            fwd(x)
         if device.type == 'cuda':
             torch.cuda.synchronize()
             st, en = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             st.record()
             for _ in range(repeats):
-                model(x)
+                fwd(x)
             en.record()
             torch.cuda.synchronize()
             ms = st.elapsed_time(en) / repeats
@@ -322,9 +324,9 @@ def profile_latency(model, size, device, dtype, warmup, repeats):
         else:
             t0 = time.time()
             for _ in range(repeats):
-                model(x)
+                fwd(x)
             ms, mem = (time.time() - t0) * 1000 / repeats, None
-    return dict(size=f'{size[0]}x{size[1]}', precision=dtype, latency_ms=ms, peak_memory_GB=mem)
+    return dict(size=f'{size[0]}x{size[1]}', protocol=protocol, precision=dtype, latency_ms=ms, peak_memory_GB=mem)
 
 
 def cost_report(cfg, run=None, device=None):
@@ -349,15 +351,21 @@ def cost_report(cfg, run=None, device=None):
     res['srb_vs_plain_conv_M'] = dict(srb_blocks=srb_p / 1e6, plain_conv_blocks=plain_p / 1e6, difference=(srb_p - plain_p) / 1e6)
     res['macs'] = {f'{h}x{w}': count_macs(model, (h, w), device) for (h, w) in [(256, 256), (128, 128)]}
     rows = []
-    for size in cfg.PROFILE_SIZES:
-        for dt in ('fp32', 'fp16'):
-            if dt == 'fp16' and device.type != 'cuda':
-                continue
-            try:
-                rows.append(profile_latency(model, size, device, dt, cfg.PROFILE_WARMUP if device.type == 'cuda' else 1,
-                                            cfg.PROFILE_REPEATS if device.type == 'cuda' else 2))
-            except torch.cuda.OutOfMemoryError:
-                rows.append(dict(size=f'{size[0]}x{size[1]}', precision=dt, latency_ms=None, peak_memory_GB='OOM'))
+    # the protocol used for every reported number (Config.INFERENCE_PROTOCOL / validation selection) is profiled too
+    sel = read_json(os.path.join(cfg.analysis_dir('inference_protocol'), 'selection.json'), {}).get('selected')
+    used = cfg.INFERENCE_PROTOCOL if cfg.INFERENCE_PROTOCOL != 'auto' else (sel or 'full')
+    for proto in ['full'] + ([used] if used != 'full' else []):
+        for size in cfg.PROFILE_SIZES:
+            for dt in ('fp32', 'fp16'):
+                if dt == 'fp16' and device.type != 'cuda':
+                    continue
+                try:
+                    rows.append(profile_latency(model, size, device, dt, cfg.PROFILE_WARMUP if device.type == 'cuda' else 1,
+                                                cfg.PROFILE_REPEATS if device.type == 'cuda' else 2, proto))
+                except torch.cuda.OutOfMemoryError:
+                    rows.append(dict(size=f'{size[0]}x{size[1]}', protocol=proto, precision=dt, latency_ms=None, peak_memory_GB='OOM'))
+                rows[-1]['used_for_reported_results'] = proto == used
+    res['inference_protocol_used'] = used
     res['inference_profile'] = rows
     # peak memory of one training step (batch BATCH_SIZE, patch, AMP, all loss terms)
     if device.type == 'cuda':
@@ -380,7 +388,8 @@ def cost_report(cfg, run=None, device=None):
         except Exception as e:
             res['training_step_peak_memory_GB'] = f'failed: {e}'
     write_json(res, os.path.join(out_dir, 'cost.json'))
-    save_table([dict(size=r['size'], precision=r['precision'], latency_ms=r['latency_ms'], peak_memory_GB=r['peak_memory_GB'])
+    save_table([dict(size=r['size'], protocol=r['protocol'], used_for_reported_results=r['used_for_reported_results'],
+                     precision=r['precision'], latency_ms=r['latency_ms'], peak_memory_GB=r['peak_memory_GB'])
                 for r in rows], 'table10_latency_memory', cfg, digits=dict(latency_ms=1, peak_memory_GB=2))
     return res
 
@@ -1064,7 +1073,8 @@ def main_tables(cfg, run_id):
     if rows:
         main = [r for r in rows if r['benchmark'] in cfg.ABLATION_BENCHMARKS]
         if len(main) == len(cfg.ABLATION_BENCHMARKS):
-            rows.append(dict(benchmark='mean(GoPro, Rain100L, SIDD)', n=None, psnr=float(np.mean([r['psnr'] for r in main])),
+            rows.append(dict(benchmark=f'mean(GoPro, Rain100L, SIDD) of {run_id} (final model; the ablation reference of '
+                                       f'Tables 6-9 is {cfg.FULL_RUN_ID})', n=None, psnr=float(np.mean([r['psnr'] for r in main])),
                              ssim=float(np.mean([r['ssim'] for r in main]))))
     save_table(rows, 'table4_5_main_results', cfg, digits=dict(n=0, psnr=2, ssim=3, lpips=3, dists=3, psnr_y=2, ssim_y=3,
                                                               input_psnr=2, input_ssim=3, gt_resized=0))
