@@ -80,7 +80,7 @@ Outputs used by the manuscript (all under `OUTPUT_ROOT/tables`, CSV + LaTeX rows
 | TODO-14 | `table11_perceptual` (+ per-image CSVs) |
 | TODO-15 | `table12_loss_sensitivity` |
 | TODO-16 | `table13_prompt_probe`, `table13_mixed_degradations` |
-| TODO-17 | `table14_zero_shot` |
+| TODO-17 | `table14_zero_shot`: per unseen degradation (LIVE1 JPEG q10, LOL, DPDD; none in the training pool), effect vs the untouched input (Δ PSNR with bootstrap CI, Wilcoxon test, % images improved / unchanged / degraded, input vs output LPIPS/DISTS), Prompt-Learner routing (`analysis/prompt_probe/zero_shot_routing.json`), the same for PromptIR (also zero-shot there), and a verdict derived from the statistics only |
 | Tables 6, 7, SCWAM vs Swin design | `table6_component_ablation`, `table7_loss_ablation`, `table_scwam_design` |
 | phase / amplitude (R3-2, R5-2) | `spectral_amplitude_phase_attribution`, `spectral_srb_phase_and_gates` |
 | Section 4.1 | `section41_runs`, `section41_reproducibility.json` |

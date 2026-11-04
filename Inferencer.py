@@ -213,7 +213,7 @@ def eval_signature(cfg, bench, protocol, extra=None):
     return hashlib.md5(json.dumps(blob, sort_keys=True, default=str).encode()).hexdigest()
 
 
-METRIC_PROTOCOL_VERSION = 2   # 2: per-benchmark registration (Koehler), inference protocols
+METRIC_PROTOCOL_VERSION = 3   # 2: per-benchmark registration (Koehler), inference protocols; 3: input LPIPS/DISTS (TODO-17)
 
 
 def _centre_crop(t, max_hw):
@@ -353,7 +353,8 @@ class Evaluator:
             out_s, gt_s, info = self.prepare(bench, out.float(), gt.to(out.device))
             in_s, gt_i, _ = self.prepare(bench, x.float(), gt.to(x.device))
             m = suite(out_s, gt_s)
-            mi = self.light(in_s, gt_i)
+            zero_shot = bench in self.cfg.ZERO_SHOT_BENCHMARKS   # TODO-17: perceptual metrics of the input as well
+            mi = (suite if zero_shot else self.light)(in_s, gt_i)
             if info is not None:
                 n_unaligned += int(not info['ecc_converged'])
             n_resized += int(bool(item.get('gt_resized')))
@@ -361,6 +362,8 @@ class Evaluator:
             for k in names:
                 row[k] = m[k][0]
             row.update(input_psnr=mi['psnr'][0], input_ssim=mi['ssim'][0], H=x.shape[2], W=x.shape[3], ms=round(ms, 2))
+            if zero_shot:
+                row.update({f'input_{k}': mi[k][0] for k in names if k in mi and k not in ('psnr', 'ssim')})
             rows.append(row)
             if collect_prompts and p is not None:
                 prompts.append(p.float().cpu().numpy()[0])

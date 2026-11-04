@@ -18,7 +18,7 @@ from Inferencer import Evaluator, KASIRNetInferencer, select_inference_protocol 
 from metrics import MetricSuite  # nb:skip
 from Analysis import (step0_audit, cost_report, significance_report, prompt_probe_report, severity_report,  # nb:skip
                       feature_stability_report, spectral_report, qualitative_figures, ablation_tables,  # nb:skip
-                      main_tables, section41_report, srb_consistency_report, protocol_effect_report,  # nb:skip
+                      main_tables, section41_report, srb_consistency_report, protocol_effect_report, zero_shot_report,  # nb:skip
                       SEVERITY_LEVELS)  # nb:skip
 
 
@@ -301,6 +301,7 @@ class Experiment:
             cost=lambda: cost_report(cfg, cfg.all_runs()[rid], self.device),
             significance=lambda: significance_report(cfg, ev, rid),
             probe=lambda: prompt_probe_report(cfg, self._roots, ev, self.model(rid), rid),
+            zero_shot=lambda: zero_shot_report(cfg, ev, rid),
             spectral=lambda: spectral_report(cfg, self._roots, self.model(rid), self.device),
             srb_consistency=lambda: srb_consistency_report(cfg, self._roots, self.model(rid), self.device),
             protocol_effect=lambda: protocol_effect_report(cfg, ev, self.model(rid), rid),

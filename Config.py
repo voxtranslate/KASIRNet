@@ -83,6 +83,12 @@ class Config:
         'reside6k': {'ADSM': f'{COMPETITOR_ROOT}/reside6k/ADSM'},
         'sidd':     {'Defusion': f'{COMPETITOR_ROOT}/sidd/Defusion'},
     }
+    # TODO-17: unseen degradations (never in the training pool) and all-in-one models that are zero-shot on them too
+    ZERO_SHOT_BENCHMARKS = ['live1_q10', 'lol', 'dpdd']
+    ZERO_SHOT_COMPETITORS = {'live1_q10': {'PromptIR (noise/rain/haze)': f'{COMPETITOR_ROOT}/live1_q10/PromptIR'},
+                             'lol':       {'PromptIR (noise/rain/haze)': f'{COMPETITOR_ROOT}/lol/PromptIR'},
+                             'dpdd':      {'PromptIR (noise/rain/haze)': f'{COMPETITOR_ROOT}/dpdd/PromptIR'}}
+    ZERO_SHOT_CHANGE_DB = 0.1     # |delta PSNR| below this counts as "unchanged" for an image
     FIGURE_COMPETITORS = {          # supplementary Figs. S1/S2 (TODO-06): up to 3 methods each
         'rain100l':   {'PromptIR': f'{COMPETITOR_ROOT}/rain100l/PromptIR', 'AdaIR': f'{COMPETITOR_ROOT}/rain100l/AdaIR',
                        'Restormer': f'{COMPETITOR_ROOT}/rain100l/Restormer'},

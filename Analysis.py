@@ -495,6 +495,20 @@ def prompt_probe_report(cfg, roots, evaluator, model, run_id):
             projections[mb] = (Pm, None)
         except Exception as e:
             print(f'[probe] {mb} skipped: {e}')
+    # TODO-17: to which known degradation does the descriptor of an UNSEEN degradation look closest?
+    routing = {}
+    for zb in cfg.ZERO_SHOT_BENCHMARKS:
+        try:
+            Pz = collect_descriptors(cfg, roots, model, zb, cfg.PROBE_IMAGES_PER_FAMILY, dev)
+            pr = clf.predict_proba(Pz)
+            top = np.bincount(pr.argmax(1), minlength=len(fams)) / len(pr)
+            routing[zb] = dict(n=len(Pz), mean_probability={f: float(pr[:, i].mean()) for i, f in enumerate(fams)},
+                               top1_share={f: float(top[i]) for i, f in enumerate(fams)},
+                               routed_to=fams[int(top.argmax())], routed_share=float(top.max()))
+            projections[zb] = (Pz, None)
+        except Exception as e:
+            print(f'[probe] zero-shot routing of {zb} skipped: {e}')
+    write_json(routing, os.path.join(out_dir, 'zero_shot_routing.json'))
     write_json(probe, os.path.join(out_dir, 'probe.json'))
     save_table([dict(families=', '.join(fams), n_per_family=probe['n_per_family'], cv_accuracy_mean=probe['cv_accuracy_mean'] * 100,
                      cv_accuracy_std=probe['cv_accuracy_std'] * 100, **{f'recall_{k}': v * 100 for k, v in probe['per_class_recall'].items()})],
@@ -984,6 +998,60 @@ def ablation_tables(cfg):
 # 10. main tables, Rain100H, zero-shot, Section 4.1
 # ==========================================
 
+def zero_shot_report(cfg, evaluator, run_id):
+    """TODO-17, answered without embellishment: for each unseen degradation, what the model does to the image
+    compared with leaving it untouched (per-image delta PSNR with a bootstrap CI, Wilcoxon signed-rank test vs the
+    input, share of images improved / unchanged / degraded, perceptual change), to which known degradation the
+    Prompt Learner routes it, and the same numbers for an all-in-one model that is zero-shot on it too.
+    The verdict column is derived from the statistics only."""
+    cats = cfg.train_categories()
+    routing = read_json(os.path.join(cfg.analysis_dir('prompt_probe'), 'zero_shot_routing.json'), {})
+    thr, rows = cfg.ZERO_SHOT_CHANGE_DB, []
+
+    def describe(name, outs, ins_key):
+        d = np.array([r['psnr'] - r[ins_key] for r in outs])
+        t = paired_test([r['psnr'] for r in outs], [r[ins_key] for r in outs], cfg.BOOTSTRAP_RESAMPLES, cfg.BOOTSTRAP_SEED)
+        sig = t.get('p_value') is not None and t['p_value'] < 0.05
+        verdict = ('improves the input' if sig and t['diff_ci_low'] > 0 else 'degrades the input' if sig and t['diff_ci_high'] < 0
+                   else 'no significant change (behaves like the identity)')
+        return dict(method=name, n=len(outs), psnr=float(np.mean([r['psnr'] for r in outs])), delta_psnr=float(d.mean()),
+                    delta_ci_low=t['diff_ci_low'], delta_ci_high=t['diff_ci_high'], p_wilcoxon_vs_input=t.get('p_value'),
+                    improved_pct=float((d > thr).mean() * 100), unchanged_pct=float((np.abs(d) <= thr).mean() * 100),
+                    degraded_pct=float((d < -thr).mean() * 100), verdict=verdict)
+
+    for b in cfg.ZERO_SHOT_BENCHMARKS:
+        ours = per_image(cfg, run_id, b)
+        if not ours:
+            continue
+        fam = cfg.benchmarks()[b]['family']
+        seen = sorted(n for n, c in cats.items() if c['family'] == fam)
+        base = dict(benchmark=b, degradation=fam, training_exposure=('SEEN in training: ' + ', '.join(seen)) if seen else 'zero-shot (never in training)',
+                    input_psnr=float(np.mean([r['input_psnr'] for r in ours])), input_ssim=float(np.mean([r['input_ssim'] for r in ours])))
+        for k in ('lpips', 'dists'):
+            if f'input_{k}' in ours[0]:
+                base[f'input_{k}'] = float(np.mean([r[f'input_{k}'] for r in ours]))
+        rt = routing.get(b)
+        if rt:
+            base.update(prompt_routed_to=rt['routed_to'], prompt_routed_share_pct=rt['routed_share'] * 100)
+        r = dict(base, **describe('KASIRNet', ours, 'input_psnr'))
+        r.update(ssim=float(np.mean([x['ssim'] for x in ours])),
+                 **{k: float(np.mean([x[k] for x in ours])) for k in ('lpips', 'dists') if k in ours[0]})
+        rows.append(r)
+        for method, folder in cfg.ZERO_SHOT_COMPETITORS.get(b, {}).items():
+            path = os.path.join(cfg.analysis_dir('competitors'), b, method.replace(' ', '_').replace('/', '-') + '.csv')
+            comp = evaluator.score_folder(b, method, folder, path) if evaluator is not None else read_rows(path)
+            pairs = join_by_key(ours, comp)
+            if len(pairs) >= 2:
+                cr = [dict(c, input_psnr=o['input_psnr']) for o, c in pairs]
+                rows.append(dict(base, **describe(method, cr, 'input_psnr'), ssim=float(np.mean([c['ssim'] for c in cr])),
+                                 **{k: float(np.mean([c[k] for c in cr])) for k in ('lpips', 'dists') if k in cr[0]}))
+    save_table(rows, 'table14_zero_shot', cfg,
+               digits=dict(n=0, input_psnr=2, input_ssim=3, input_lpips=3, input_dists=3, psnr=2, ssim=3, lpips=3, dists=3,
+                           delta_psnr=2, delta_ci_low=2, delta_ci_high=2, p_wilcoxon_vs_input=4, improved_pct=1,
+                           unchanged_pct=1, degraded_pct=1, prompt_routed_share_pct=1))
+    return rows
+
+
 def main_tables(cfg, run_id):
     rows = []
     for b in cfg.MAIN_BENCHMARKS + ['rain100h']:
@@ -999,18 +1067,7 @@ def main_tables(cfg, run_id):
                              ssim=float(np.mean([r['ssim'] for r in main]))))
     save_table(rows, 'table4_5_main_results', cfg, digits=dict(n=0, psnr=2, ssim=3, lpips=3, dists=3, psnr_y=2, ssim_y=3,
                                                               input_psnr=2, input_ssim=3, gt_resized=0))
-    zs = []
-    cats = cfg.train_categories()
-    for b in ('live1_q10', 'lol', 'dpdd'):
-        e = read_json(os.path.join(cfg.run_dir(run_id), 'eval', b, 'summary.json'))
-        if e:
-            fam = cfg.benchmarks()[b]['family']
-            real = sorted(n for n, c in cats.items() if c['family'] == fam and not c.get('synth'))
-            synth = sorted(n for n, c in cats.items() if c.get('synth') == 'composite' and fam in ('jpeg', 'lowlight', 'defocus'))
-            exposure = ('real pairs: ' + ', '.join(real)) if real else ('synthetic only: ' + ', '.join(synth)) if synth else 'zero-shot'
-            zs.append(dict(benchmark=b, n=e['n_images'], training_exposure=exposure, input_psnr=e['input_psnr'],
-                           input_ssim=e['input_ssim'], psnr=e['psnr'], ssim=e['ssim']))
-    save_table(zs, 'table14_zero_shot', cfg, digits=dict(n=0, input_psnr=2, input_ssim=3, psnr=2, ssim=3))
+    zs = zero_shot_report(cfg, None, run_id)
     return rows, zs
 
 
