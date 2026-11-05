@@ -17,7 +17,7 @@ class Config:
     # or analysis is detected from its JSON and skipped), so the notebook can be
     # re-run in as many Colab sessions as needed.
     # the final model first (paper numbers), then the ablation reference and the ablations
-    STAGES = ['audit', 'train_main', 'eval_full', 'competitors', 'analyses_full', 'train_full', 'ablations', 'analyses_ablation',
+    STAGES = ['audit', 'train_full', 'train_main', 'eval_full', 'competitors', 'analyses_full', 'ablations', 'analyses_ablation',
               'tables']
     RUN_COMPETITORS = True        # stage 'competitors': public competitor models (Competitors.py) restore the test sets
 
@@ -369,20 +369,17 @@ class Config:
     ETA_MIN = 1e-7                # cosine annealing per iteration from LR to ETA_MIN over the whole budget
     GRAD_CLIP = 1.0
     # Budget.  One epoch = one pass over the (capped, repeated) training pool, i.e. floor(N_train / BATCH_SIZE)
-    # iterations (~30,400 samples with the two synthetic categories -> ~474 iterations at batch 64).
-    # KASIRNet_full and every ablation run: 150 epochs (~71,000 iterations), the same recipe, so every ablation
-    # is compared with a reference trained exactly like it; "full, seed SEED" is KASIRNet_full itself (trained
-    # once).  main() prints the measured s/iteration and the GPU-hours left before the ablations.
-    EPOCHS = 150                  # reference full model KASIRNet_full (= "full, seed 1" of every ablation table)
-    ABLATION_EPOCHS = 150         # every ablation run: the same budget and recipe as KASIRNet_full
-    # Final model of Tables 4-5 (run MAIN_RUN_ID): 300 epochs from scratch (~131,000 updates at batch 64, about the
-    # budget of comparable all-in-one models), same recipe as below.  The ablations use a shorter but IDENTICAL budget
-    # for every variant and for their own full reference (KASIRNet_full = "full, seed 1"), as is standard (e.g. the
-    # Restormer ablations use 100k iterations): an ablation is fair when each variant is compared with a reference
-    # trained exactly like it.  ABLATION_EPOCHS = EPOCHS = 300 is possible (~60 GPU-h per run instead of ~30).
+    # iterations (26,662 samples -> 416 iterations at batch 64).  Every run gets 100 epochs (41,600 iterations) and
+    # the same recipe: the reported model KASIRNet_full is also "full, seed 1" of every ablation table (trained once).
+    # A paused run resumes when only the budget changed (the cosine schedule follows the new budget), and a compatible
+    # checkpoint of an earlier notebook version is taken over (Trainer.adopt_checkpoint).
+    EPOCHS = 100                  # KASIRNet_full: the reported model AND "full, seed 1" of every ablation table (trained once)
+    ABLATION_EPOCHS = 100         # every ablation run: the same budget and recipe as KASIRNet_full
+    # Optional separate final model (MAIN_EPOCHS > 0, e.g. 300): trained after KASIRNet_full with the same recipe.
     MAIN_RUN_ID = 'KASIRNet_main'
     MAIN_INIT_FROM = None         # trained from scratch (set 'KASIRNet_full' for a warm restart from the reference)
-    MAIN_EPOCHS = 300             # final model: 300 epochs, one cosine cycle
+    MAIN_EPOCHS = 0               # 0: the reported model is KASIRNet_full itself (same budget as the ablations);
+                                  # > 0: a separate, longer final model (e.g. 300) trained after KASIRNet_full
     MAIN_LR = 3e-4
     MAIN_WARMUP_ITERS = 1500
     CKPT_EVERY_ITERS = 2000       # resumable checkpoint (atomic write) every N iterations

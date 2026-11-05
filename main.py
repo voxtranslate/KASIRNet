@@ -13,7 +13,7 @@ from Config import Config  # nb:skip
 from Datasets import (resolve_sources, spec_sources, build_training_manifest, BenchmarkDataset, DatasetCache,  # nb:skip
                       manifest_is_current, overlap_benchmarks, manifest_used_files, validate_data, resolve_path,  # nb:skip
                       benchmark_files, validation_signature)  # nb:skip
-from Trainer import Trainer, read_json, write_json, try_lock, release_lock, recipe_signature  # nb:skip
+from Trainer import Trainer, read_json, write_json, try_lock, release_lock, recipe_signature, adopt_checkpoint  # nb:skip
 from Inferencer import Evaluator, KASIRNetInferencer, select_inference_protocol  # nb:skip
 from metrics import MetricSuite  # nb:skip
 from Competitors import competitor_plan, competitor_folders, generate_competitor_outputs  # nb:skip
@@ -272,6 +272,9 @@ class Experiment:
             print(f'[{rid}] being trained by another session -> skipped here')
             return 'locked'
         try:
+            self.manifest()
+            also = (self.cfg.MAIN_RUN_ID,) if rid == self.cfg.FULL_RUN_ID else ((self.cfg.FULL_RUN_ID,) if rid == self.cfg.MAIN_RUN_ID else ())
+            adopt_checkpoint(self.cfg, run, also)
             rec = Trainer(self.cfg, run, self.manifest(), self.device).fit()
         finally:
             release_lock(self.cfg, rid)

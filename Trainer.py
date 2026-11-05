@@ -149,35 +149,105 @@ LOSS_CALIBRATION_VERSION = 1
 TRAIN_CODE_VERSION = 3   # bumped when the training computation changes (3: calibrated loss, ortho FFT, eval-mode loss nets, no train clamp)
 
 
-def recipe_signature(cfg, run):
-    """Everything that defines what a run learns: training pool, budget, optimiser, schedule, model, loss.
-    A stored run (complete or paused) with another signature is superseded and trained again."""
-    blob = [manifest_signature(cfg), run['epochs'], float(run.get('lr', cfg.LR)), int(run.get('warmup', cfg.WARMUP_ITERS)),
+def recipe_core(cfg, run):
+    """What a run learns apart from its length: training pool, optimiser, warm-up, initialisation, seed, model, loss."""
+    blob = [manifest_signature(cfg), float(run.get('lr', cfg.LR)), int(run.get('warmup', cfg.WARMUP_ITERS)),
             run.get('init_from'), run['seed'], cfg.model_kwargs(run), cfg.loss_weights(run), cfg.LOSS_CALIBRATION,
             LOSS_CALIBRATION_VERSION, cfg.BATCH_SIZE, cfg.PATCH_SIZE, list(cfg.BETAS), cfg.WEIGHT_DECAY, cfg.ETA_MIN,
             cfg.GRAD_CLIP, cfg.AMP, cfg.AMP_DTYPE, TRAIN_CODE_VERSION]
     return hashlib.md5(json.dumps(blob, sort_keys=True, default=str).encode()).hexdigest()
 
 
+def recipe_signature(cfg, run):
+    """Core recipe + budget: a COMPLETE run counts only with exactly this signature."""
+    return hashlib.md5(json.dumps([recipe_core(cfg, run), run['epochs']]).encode()).hexdigest()
+
+
+def _legacy_signature(cfg, run, rec):
+    """Signature of `run` with the budget the stored record was trained for (records written before recipe_core)."""
+    ep = (rec.get('budget') or {}).get('epochs')
+    return recipe_signature(cfg, dict(run, epochs=ep)) if ep is not None else None
+
+
+def resumable_checkpoint(cfg, run, rdir, cdir):
+    """Iteration of a paused checkpoint in (rdir, cdir) that has the same core recipe as `run` (any budget), else None.
+    Records of earlier notebook versions (no recipe_core) are checked against the checkpoint's own metadata."""
+    rec = read_json(os.path.join(rdir, 'run.json'), {})
+    path = os.path.join(cdir, 'last.pth')
+    if not os.path.exists(path) or rec.get('status') == 'complete':
+        return None
+    core = recipe_core(cfg, run)
+    ok = rec.get('recipe_core') == core or (rec.get('recipe_signature') and rec.get('recipe_signature') == _legacy_signature(cfg, run, rec))
+    ck = torch.load(path, map_location='cpu', weights_only=False)
+    if not ok:   # legacy record: compare what the checkpoint and the record state explicitly
+        opt = rec.get('optimisation') or {}
+        ok = (ck.get('manifest_signature') == manifest_signature(cfg) and ck.get('model_flags') == cfg.model_kwargs(run)
+              and ck.get('loss_weights') == cfg.loss_weights(run) and rec.get('seed') == run['seed']
+              and 'loss_scales' in rec and opt.get('warmup_iters') == int(run.get('warmup', cfg.WARMUP_ITERS))
+              and abs(float(opt.get('lr', -1)) - float(run.get('lr', cfg.LR))) < 1e-12
+              and (opt.get('initialised_from') or None) == (run.get('init_from') or None))
+    return int(ck.get('iteration', 0)) if ok else None
+
+
 def supersede_if_stale(cfg, run):
     """Moves runs/<id> and checkpoints/<id> aside (<id>__superseded_N, nothing deleted) when they were produced
-    with another recipe, e.g. by an earlier version of this notebook.  Returns True if something was moved."""
+    with another recipe.  Kept: a complete run with exactly this recipe and budget, and a PAUSED run with the same
+    core recipe (any budget: it resumes and its cosine schedule follows the new budget)."""
     rid = run['run_id']
     rdir, cdir = cfg.run_dir(rid), cfg.ckpt_dir(rid)
     rec = read_json(os.path.join(rdir, 'run.json'), {})
     has_ck = os.path.isdir(cdir) and any(f.endswith('.pth') for f in os.listdir(cdir))
     if not rec and not has_ck:
         return False
-    if rec.get('recipe_signature') == recipe_signature(cfg, run):
+    if rec.get('recipe_signature') == recipe_signature(cfg, run) and rec.get('status') == 'complete':
         return False
+    if rec.get('status') != 'complete' and resumable_checkpoint(cfg, run, rdir, cdir) is not None:
+        return False
+    _move_aside(rdir, cdir)
+    print(f'[{rid}] !! stored run was trained with another recipe (training pool, budget, learning rate, loss or code '
+          f'version): moved aside (*__superseded_N); it is trained again with the current recipe')
+    return True
+
+
+def _move_aside(rdir, cdir):
     k = 1
     while os.path.exists(f'{rdir}__superseded_{k}') or os.path.exists(f'{cdir}__superseded_{k}'):
         k += 1
     for d in (rdir, cdir):
         if os.path.exists(d):
             os.replace(d, f'{d}__superseded_{k}')
-    print(f'[{rid}] !! stored run was trained with another recipe (training pool, budget, learning rate, loss or code '
-          f'version): moved to *__superseded_{k}; it is trained again with the current recipe')
+
+
+def adopt_checkpoint(cfg, run, also=()):
+    """Do not lose training time: if `run` has no resumable checkpoint of its own, take over the most advanced
+    PAUSED checkpoint with the same core recipe among <id>__superseded_*, and the runs in `also` (e.g. the final-model
+    run, which has the same recipe as the reference when both are trained from scratch with the same seed)."""
+    rid = run['run_id']
+    rdir, cdir = cfg.run_dir(rid), cfg.ckpt_dir(rid)
+    own = resumable_checkpoint(cfg, run, rdir, cdir) if os.path.isdir(cdir) else None
+    root_r, root_c = os.path.dirname(rdir), os.path.dirname(cdir)
+    names = set()
+    for base in (os.path.basename(rdir),) + tuple(also):
+        if os.path.isdir(root_c):
+            names |= {n for n in os.listdir(root_c) if n == base or n.startswith(base + '__superseded_')}
+    best = (own if own is not None else -1, None)
+    for n in sorted(names - {os.path.basename(cdir)}):
+        try:
+            it = resumable_checkpoint(cfg, run, os.path.join(root_r, n), os.path.join(root_c, n))
+        except Exception as e:
+            print(f'[{rid}] checkpoint {n} not readable: {e}')
+            continue
+        if it is not None and it > best[0]:
+            best = (it, n)
+    if best[1] is None:
+        return False
+    if os.path.exists(rdir) or os.path.exists(cdir):
+        _move_aside(rdir, cdir)
+    os.replace(os.path.join(root_c, best[1]), cdir)
+    if os.path.isdir(os.path.join(root_r, best[1])):
+        os.replace(os.path.join(root_r, best[1]), rdir)
+    print(f'[{rid}] continues from the checkpoint of {best[1]} (iteration {best[0]}): same training pool, model, loss and '
+          f'learning rate; only the budget may differ')
     return True
 
 
@@ -221,7 +291,7 @@ class Trainer:
         self.cfg, self.run = cfg, run
         self.run_id = run['run_id']
         supersede_if_stale(cfg, run)
-        self.recipe = recipe_signature(cfg, run)
+        self.recipe, self.recipe_core = recipe_signature(cfg, run), recipe_core(cfg, run)
         self.device = torch.device(device or (cfg.DEVICE if torch.cuda.is_available() else 'cpu'))
         self.ckdir, self.rundir = cfg.ckpt_dir(self.run_id), cfg.run_dir(self.run_id)
         os.makedirs(self.ckdir, exist_ok=True)
@@ -393,7 +463,7 @@ class Trainer:
     def _write_record(self, status):
         rec = dict(self.record)
         rec.update(run_id=self.run_id, group=self.run['group'], seed=self.run['seed'], status=status,
-                   recipe_signature=self.recipe,
+                   recipe_signature=self.recipe, recipe_core=self.recipe_core,
                    budget=dict(epochs=self.run['epochs'], iters_per_epoch=self.ipe, total_iters=self.total_iters,
                                iterations_done=self.iteration, batch_size=self.cfg.BATCH_SIZE, patch=self.cfg.PATCH_SIZE,
                                samples_seen=self.iteration * self.cfg.BATCH_SIZE),
