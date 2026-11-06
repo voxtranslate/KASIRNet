@@ -88,3 +88,10 @@ Not changed (architecture), to be described accurately in the paper:
 * Each decoder stage receives the VGG features of the next coarser scale (e.g. decoder1 at H/2 receives pool1 features at H/4), up-sampled bilinearly inside the SIM.
 * There is one SCWAM layer per scale, always shifted by 4, so there is no alternation between regular and shifted windows as in Swin. The shift moves the window grid and adds wrap-around windows at the borders.
 * The SSIM term is computed on luminance only (Y of YIQ), like the metric.
+
+## Run plan of 5 November 2026 (TODO_computations.md)
+
+* **Runs.** 23 trainings, R01–R23, replace the earlier 45-run design: full model × 3 seeds; w/o SIM, SRB, SCWAM (seed 1); w/o Prompt/SFT × 3 seeds; the 2³ factorial on SIM / SRB / SCWAM; the ResNet-50 and ConvNeXt-T extractors; and 8 Plackett–Burman loss-weight runs.
+* **Budget B = 80 epochs** (33,280 iterations, 0.8 of the 100-epoch full schedule), identical for all 23 runs. B was fixed by the computing budget: the plan's settling rule could not be applied, because no "w/o SIM" validation log existed beforehand. R01 is trained inside the family; the full-budget model of Tables 4–5 is `KASIRNet_full` (100 epochs).
+* **Statistics.** The rules of the plan (seed spread with conditional pooling, prediction threshold for single runs, Welch test for Prompt/SFT, factorial effects with SE = s/√2, Plackett–Burman main effects, curvature and spare column) are implemented verbatim in `Analysis.ablation_tables` and were fixed before any result.
+* **Not re-run.** The submitted Tables 6 (components) and 7 (loss terms) and the SRB + L_fft pair are not re-run, as the plan states.

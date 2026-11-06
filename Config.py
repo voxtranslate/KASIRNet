@@ -373,8 +373,11 @@ class Config:
     # the same recipe: the reported model KASIRNet_full is also "full, seed 1" of every ablation table (trained once).
     # A paused run resumes when only the budget changed (the cosine schedule follows the new budget), and a compatible
     # checkpoint of an earlier notebook version is taken over (Trainer.adopt_checkpoint).
-    EPOCHS = 100                  # KASIRNet_full: the reported model AND "full, seed 1" of every ablation table (trained once)
-    ABLATION_EPOCHS = 100         # every ablation run: the same budget and recipe as KASIRNet_full
+    EPOCHS = 100                  # KASIRNet_full: the full-budget model reported in Tables 4-5
+    # Reduced budget B of the RUN PLAN (TODO_computations.md, 5 Nov 2026): 80 epochs = 0.8 of the full schedule
+    # (33,280 iterations), identical for the 23 runs R01-R23, cosine to ETA_MIN over B.  R01 (full model, seed 1)
+    # is trained inside this family (it differs from KASIRNet_full by its budget).
+    ABLATION_EPOCHS = 80
     # Optional separate final model (MAIN_EPOCHS > 0, e.g. 300): trained after KASIRNet_full with the same recipe.
     MAIN_RUN_ID = 'KASIRNet_main'
     MAIN_INIT_FROM = None         # trained from scratch (set 'KASIRNet_full' for a warm restart from the reference)
@@ -399,8 +402,20 @@ class Config:
     # ----------------------------------------------------------- run plan
     FULL_RUN_ID = 'KASIRNet_full'
     ABLATION_SEEDS = (1, 2, 3)
-    RUN_ABLATION_GROUPS = ['TODO12A_seeds', 'TODO09B_extractor', 'TODO12B_interactions', 'TODO15_loss_sensitivity',
-                           'T6_components', 'T7_loss_terms', 'SCWAM_design']
+    # RUN PLAN, 23 runs at budget B; launch order of the plan, so that a partial completion still gives usable tables:
+    # R01-R03, R04-R07, R10-R13; then R14-R15; then R16-R23; last R08-R09
+    RUN_ABLATION_GROUPS = ['R01-R07_core', 'R10-R13_factorial', 'R14-R15_extractors', 'R16-R23_loss_PB', 'R08-R09_prompt_seeds']
+    # Plackett-Burman design of the loss weights (R16-R23): +1 = weight x2, -1 = weight x0.5; 7th column = spare
+    # (assigned to no weight).  X'X = 8I (checked in Analysis.ablation_tables).
+    PB_FACTORS = ('pix', 'fft', 'perc', 'ssim', 'id', 'edge', 'spare')
+    PB_DESIGN = ((+1, +1, +1, -1, +1, -1, -1),
+                 (-1, +1, +1, +1, -1, +1, -1),
+                 (-1, -1, +1, +1, +1, -1, +1),
+                 (+1, -1, -1, +1, +1, +1, -1),
+                 (-1, +1, -1, -1, +1, +1, +1),
+                 (+1, -1, +1, -1, -1, +1, +1),
+                 (+1, +1, -1, +1, -1, -1, +1),
+                 (-1, -1, -1, -1, -1, -1, -1))
 
     # --------------------------------------------------------------- analyses
     BOOTSTRAP_RESAMPLES = 10000
@@ -471,40 +486,35 @@ class Config:
         return dict(run_id=self.FULL_RUN_ID, group='full', seed=self.SEED, epochs=self.EPOCHS, model={}, loss={})
 
     def ablation_groups(self):
-        S = self.ABLATION_SEEDS
+        """RUN PLAN of TODO_computations.md (R01-R23).  Every 'w/o' variant uses the replacement block of the submitted
+        ablation (SRB -> plain conv, SCWAM+Meshgrid -> local conv, Prompt/SFT removed, SIM removed)."""
         E = self.ABLATION_EPOCHS
         w = self.LOSS_WEIGHTS
 
-        def run(rid, group, seed=1, model=None, loss=None):
-            return dict(run_id=rid, group=group, seed=seed, epochs=E, model=model or {}, loss=loss or {})
+        def run(label, rid, group, seed=1, model=None, loss=None):
+            return dict(run_id=rid, label=label, group=group, seed=seed, epochs=E, model=model or {}, loss=loss or {})
 
-        variants = [('full', {}), ('noSIM', dict(use_sim=False)), ('noSRB', dict(use_srb=False)),
-                    ('noSCWAM', dict(use_scwam=False)), ('noPrompt', dict(use_prompt=False))]
+        pb = []
+        for i, row in enumerate(self.PB_DESIGN):
+            mult = {k: (2.0 if sgn > 0 else 0.5) for k, sgn in zip(self.PB_FACTORS, row) if k != 'spare'}
+            pb.append(run(f'R{16 + i}', f'pb{i + 1}_s1', 'R16-R23_loss_PB', loss={k: w[k] * m for k, m in mult.items()}))
         return {
-            # TODO-12 Part A: 5 variants x 3 seeds (also the VGG-19 reference of TODO-09B and default of TODO-15)
-            'TODO12A_seeds': [run(f'{n}_s{s}', 'TODO12A_seeds', s, m) for n, m in variants for s in S],
-            # TODO-09 Part B: alternative frozen extractors in the SIM
-            'TODO09B_extractor': [run('ext_resnet50_s1', 'TODO09B_extractor', model=dict(extractor='resnet50')),
-                                  run('ext_convnextT_s1', 'TODO09B_extractor', model=dict(extractor='convnext_t'))],
-            # TODO-12 Part B: pairwise interactions
-            'TODO12B_interactions': [run('noSIM+noSRB_s1', 'TODO12B_interactions', model=dict(use_sim=False, use_srb=False)),
-                                     run('noSIM+noSCWAM_s1', 'TODO12B_interactions', model=dict(use_sim=False, use_scwam=False)),
-                                     run('noSRB+noSCWAM_s1', 'TODO12B_interactions', model=dict(use_srb=False, use_scwam=False)),
-                                     run('noSRB+noFFT_s1', 'TODO12B_interactions', model=dict(use_srb=False), loss=dict(fft=0.0))],
-            # TODO-15: each loss weight halved and doubled
-            'TODO15_loss_sensitivity': [run(f'w_{k}_x{f:g}_s1', 'TODO15_loss_sensitivity', loss={k: w[k] * f})
-                                        for k in w for f in (0.5, 2.0)],
-            # Table 6 remaining rows under the same budget
-            'T6_components': [run('noMeshgrid_s1', 'T6_components', model=dict(use_meshgrid=False)),
-                              run('noGCB_s1', 'T6_components', model=dict(use_gcb=False)),
-                              run('depth3_s1', 'T6_components', model=dict(num_scales=3)),
-                              run('width32_s1', 'T6_components', model=dict(base_channels=32))],
-            # Table 7: each loss term removed
-            'T7_loss_terms': [run(f'no_{k}_s1', 'T7_loss_terms', loss={k: 0.0}) for k in w],
-            # SCWAM vs Swin design choices (Reviewer 3 comment 1, Reviewer 5 comment 1)
-            'SCWAM_design': [run('scwam_noShift_s1', 'SCWAM_design', model=dict(shift_size=0)),
-                             run('scwam_swinMask_s1', 'SCWAM_design', model=dict(masked_shift=True)),
-                             run('scwam_RPB_s1', 'SCWAM_design', model=dict(use_meshgrid=False, rel_pos_bias=True))],
+            'R01-R07_core': [run('R01', 'full_s1', 'R01-R07_core', 1), run('R02', 'full_s2', 'R01-R07_core', 2),
+                             run('R03', 'full_s3', 'R01-R07_core', 3),
+                             run('R04', 'noSIM_s1', 'R01-R07_core', model=dict(use_sim=False)),
+                             run('R05', 'noSRB_s1', 'R01-R07_core', model=dict(use_srb=False)),
+                             run('R06', 'noSCWAM_s1', 'R01-R07_core', model=dict(use_scwam=False)),
+                             run('R07', 'noPrompt_s1', 'R01-R07_core', model=dict(use_prompt=False))],
+            'R10-R13_factorial': [run('R10', 'noSIM+noSRB_s1', 'R10-R13_factorial', model=dict(use_sim=False, use_srb=False)),
+                                  run('R11', 'noSIM+noSCWAM_s1', 'R10-R13_factorial', model=dict(use_sim=False, use_scwam=False)),
+                                  run('R12', 'noSRB+noSCWAM_s1', 'R10-R13_factorial', model=dict(use_srb=False, use_scwam=False)),
+                                  run('R13', 'noSIM+noSRB+noSCWAM_s1', 'R10-R13_factorial',
+                                      model=dict(use_sim=False, use_srb=False, use_scwam=False))],
+            'R14-R15_extractors': [run('R14', 'ext_resnet50_s1', 'R14-R15_extractors', model=dict(extractor='resnet50')),
+                                   run('R15', 'ext_convnextT_s1', 'R14-R15_extractors', model=dict(extractor='convnext_t'))],
+            'R16-R23_loss_PB': pb,
+            'R08-R09_prompt_seeds': [run('R08', 'noPrompt_s2', 'R08-R09_prompt_seeds', 2, model=dict(use_prompt=False)),
+                                     run('R09', 'noPrompt_s3', 'R08-R09_prompt_seeds', 3, model=dict(use_prompt=False))],
         }
 
     def ablation_plan(self):

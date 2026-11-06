@@ -898,108 +898,140 @@ def _scores(cfg, rid, benches):
     return None if any(v is None for v in s.values()) else s
 
 
+def _y(cfg, rid, B):
+    """Per-benchmark PSNR / SSIM of a run and its three-benchmark mean y (None if not evaluated yet)."""
+    p = _scores(cfg, rid, B)
+    if p is None:
+        return None
+    q = {b: run_eval(cfg, rid, b, 'ssim') for b in B}
+    return dict(psnr=p, ssim=q, y=float(np.mean(list(p.values()))), y_ssim=float(np.mean(list(q.values()))))
+
+
 def ablation_tables(cfg):
+    """Tables 8 (extractors), 9 A (seed spread), 9 B (2^3 factorial), 12 (Plackett-Burman), with the statistical
+    rules of the RUN PLAN (TODO_computations.md), fixed before any result:
+      1. s = std (n-1) over seeds of the three-benchmark-mean PSNR from R01-R03 (nu = 2), pooled with R07-R09
+         (nu = 4) when the ratio of the two standard deviations is at most 2; per-benchmark s from R01-R03.
+      2. single-run ablation: Delta = mean(R01-R03) - y; exceeds spread if Delta > t(0.975, nu) s sqrt(1 + 1/3);
+         Prompt/SFT (n = 3 vs n = 3): Welch t-test on the three-benchmark means.
+      3. factorial (seed 1; +1 = module present): effect_X = (1/4) sum_cells prod_{i in X} sign_i * y; SE = s / sqrt(2);
+         resolved if |effect| > t(0.975, nu) SE.
+      4. Plackett-Burman: main effect = mean of the four '+' runs - mean of the four '-' runs, per benchmark;
+         SE = s_b / sqrt(2); curvature = mean(R16-R23) - R01; spare-column effect = noise level.
+      5. two decimals for PSNR and effects, three for SSIM."""
+    from scipy.stats import t as tdist, ttest_ind
     B = cfg.ABLATION_BENCHMARKS
-    ref = _scores(cfg, 'full_s1', B)
+    plan = {r['label']: r['run_id'] for g in cfg.ablation_groups().values() for r in g}
+    Y = {lab: _y(cfg, rid, B) for lab, rid in plan.items()}
     tables = {}
+    full = [Y[k] for k in ('R01', 'R02', 'R03') if Y.get(k)]
+    prom = [Y[k] for k in ('R07', 'R08', 'R09') if Y.get(k)]
+    stats = {}
+    if len(full) >= 2:
+        s_full = float(np.std([v['y'] for v in full], ddof=1))
+        s, nu, pooled = s_full, len(full) - 1, False
+        if len(prom) >= 2:
+            s_prom = float(np.std([v['y'] for v in prom], ddof=1))
+            if max(s_full, s_prom) / max(min(s_full, s_prom), 1e-12) <= 2:
+                s = float(np.sqrt(((len(full) - 1) * s_full ** 2 + (len(prom) - 1) * s_prom ** 2) / (len(full) + len(prom) - 2)))
+                nu, pooled = len(full) + len(prom) - 2, True
+        s_b = {b: float(np.std([v['psnr'][b] for v in full], ddof=1)) for b in B}
+        stats = dict(s=s, nu=nu, pooled_with_R07_R09=pooled, s_full=s_full, s_per_benchmark=s_b, t975=float(tdist.ppf(0.975, nu)))
+        write_json(stats, os.path.join(cfg.tables_dir, 'ablation_spread.json'))
+    t975 = stats.get('t975')
+    mean_full = float(np.mean([v['y'] for v in full])) if full else None
 
-    def delta_row(rid, label):
-        s = _scores(cfg, rid, B)
-        if s is None or ref is None:
-            return None
-        d = {b: s[b] - ref[b] for b in B}
-        row = dict(variant=label, run_id=rid, **{f'psnr_{b}': s[b] for b in B}, **{f'd_{b}': d[b] for b in B})
-        row['max_drop'] = min(d.values())
-        row['avg_delta'] = float(np.mean(list(d.values())))
-        row['ssim_avg'] = float(np.mean([run_eval(cfg, rid, b, 'ssim') for b in B]))
-        return row
-
-    # Table 6: components (seed 1)
-    t6 = []
-    for rid, label in [('full_s1', 'Full KASIRNet'), ('noSIM_s1', 'w/o SIM'), ('noSRB_s1', 'w/o SRB (plain conv)'),
-                       ('noSCWAM_s1', 'w/o SCWAM+Meshgrid (local conv)'), ('noPrompt_s1', 'w/o Prompt/SFT'),
-                       ('noMeshgrid_s1', 'w/o Meshgrid'), ('noGCB_s1', 'w/o GCB'), ('depth3_s1', 'depth: 3 scales'),
-                       ('width32_s1', 'width: C=32')]:
-        r = delta_row(rid, label)
-        if r:
-            t6.append(r)
-    save_table(t6, 'table6_component_ablation', cfg); tables['t6'] = t6
-    # Table 7: loss terms
-    t7 = [r for r in (delta_row(f'no_{k}_s1', f'w/o L_{k}') for k in cfg.LOSS_WEIGHTS) if r]
-    save_table(t7, 'table7_loss_ablation', cfg); tables['t7'] = t7
-    # SCWAM design
-    ts = [r for r in (delta_row(rid, lab) for rid, lab in [('scwam_noShift_s1', 'no cyclic shift'),
-                                                            ('scwam_swinMask_s1', 'Swin masked shift'),
-                                                            ('scwam_RPB_s1', 'relative position bias instead of Meshgrid')]) if r]
-    save_table(ts, 'table_scwam_design', cfg); tables['scwam'] = ts
-    # Table 9 A: seeds
+    # ---- Table 9 A: seed spread and single-module ablations
     t9 = []
-    full_avgs = None
-    for name in ('full', 'noSIM', 'noSRB', 'noSCWAM', 'noPrompt'):
-        per_seed = [_scores(cfg, f'{name}_s{s}', B) for s in cfg.ABLATION_SEEDS]
-        per_seed = [p for p in per_seed if p]
-        if not per_seed:
-            continue
-        row = dict(variant=name, n_seeds=len(per_seed))
+    if full:
+        row = dict(variant='Full model (R01-R03)', n=len(full))
         for b in B:
-            v = [p[b] for p in per_seed]
-            row[f'{b}_mean'] = float(np.mean(v)); row[f'{b}_std'] = float(np.std(v, ddof=1)) if len(v) > 1 else None
-        avg = [float(np.mean([p[b] for b in B])) for p in per_seed]
-        row['avg_mean'] = float(np.mean(avg)); row['avg_std'] = float(np.std(avg, ddof=1)) if len(avg) > 1 else None
-        if name == 'full':
-            full_avgs = avg
-        elif full_avgs and len(full_avgs) == len(avg) and len(avg) > 1:
-            from scipy.stats import ttest_rel
-            d = np.array(avg) - np.array(full_avgs)
-            row['delta_avg_mean'] = float(d.mean()); row['delta_avg_std'] = float(d.std(ddof=1))
-            row['paired_t_p'] = float(ttest_rel(avg, full_avgs).pvalue)
-        # per-image paired Wilcoxon (seed 1) on each benchmark
-        if name != 'full':
-            for b in B:
-                pairs = join_by_key(per_image(cfg, f'{name}_s1', b), per_image(cfg, 'full_s1', b))
-                if len(pairs) >= 6:
-                    t = paired_test([a['psnr'] for a, _ in pairs], [c['psnr'] for _, c in pairs], cfg.BOOTSTRAP_RESAMPLES, cfg.BOOTSTRAP_SEED)
-                    row[f'{b}_wilcoxon_p'] = t['p_value']
+            v = [x['psnr'][b] for x in full]
+            row[f'{b}_mean'], row[f'{b}_std'] = float(np.mean(v)), (float(np.std(v, ddof=1)) if len(v) > 1 else None)
+        row['avg_mean'] = mean_full
+        row['avg_std'] = float(np.std([x['y'] for x in full], ddof=1)) if len(full) > 1 else None
         t9.append(row)
-    save_table(t9, 'table9_seed_variance', cfg); tables['t9'] = t9
-    # Table 9 B: interactions  I = d(A+B) - (dA + dB)  (negative = the pair overlaps less than additive)
+    for lab, name in (('R04', 'w/o SIM'), ('R05', 'w/o SRB (plain conv)'), ('R06', 'w/o SCWAM + Meshgrid (local conv)')):
+        v = Y.get(lab)
+        if v is None:
+            continue
+        row = dict(variant=f'{name} ({lab})', n=1, **{f'{b}_mean': v['psnr'][b] for b in B}, avg_mean=v['y'])
+        if mean_full is not None:
+            row['delta'] = mean_full - v['y']
+            if stats:
+                thr = t975 * stats['s'] * np.sqrt(1 + 1 / 3)
+                row.update(threshold=float(thr), exceeds_spread=bool(row['delta'] > thr))
+        t9.append(row)
+    if prom:
+        row = dict(variant='w/o Prompt Learner / SFT (R07-R09)', n=len(prom))
+        for b in B:
+            v = [x['psnr'][b] for x in prom]
+            row[f'{b}_mean'], row[f'{b}_std'] = float(np.mean(v)), (float(np.std(v, ddof=1)) if len(v) > 1 else None)
+        row['avg_mean'] = float(np.mean([x['y'] for x in prom]))
+        row['avg_std'] = float(np.std([x['y'] for x in prom], ddof=1)) if len(prom) > 1 else None
+        if mean_full is not None:
+            row['delta'] = mean_full - row['avg_mean']
+            if len(prom) >= 2 and len(full) >= 2:
+                row['welch_p'] = float(ttest_ind([x['y'] for x in full], [x['y'] for x in prom], equal_var=False).pvalue)
+        t9.append(row)
+    save_table(t9, 'table9_seed_variance', cfg, digits=dict(n=0, exceeds_spread=0, welch_p=4)); tables['t9a'] = t9
+
+    # ---- Table 9 B: 2^3 factorial on SIM, SRB, SCWAM (seed 1)
+    cells = {'R01': (1, 1, 1), 'R04': (-1, 1, 1), 'R05': (1, -1, 1), 'R06': (1, 1, -1),
+             'R10': (-1, -1, 1), 'R11': (-1, 1, -1), 'R12': (1, -1, -1), 'R13': (-1, -1, -1)}
     t9b = []
-    for rid, a, b_ in [('noSIM+noSRB_s1', 'noSIM_s1', 'noSRB_s1'), ('noSIM+noSCWAM_s1', 'noSIM_s1', 'noSCWAM_s1'),
-                       ('noSRB+noSCWAM_s1', 'noSRB_s1', 'noSCWAM_s1')]:
-        r, ra, rb = delta_row(rid, rid), delta_row(a, a), delta_row(b_, b_)
-        if r and ra and rb:
-            t9b.append(dict(pair=rid.replace('_s1', ''), d_pair=r['avg_delta'], d_first=ra['avg_delta'], d_second=rb['avg_delta'],
-                            additive_prediction=ra['avg_delta'] + rb['avg_delta'],
-                            interaction=r['avg_delta'] - (ra['avg_delta'] + rb['avg_delta'])))
-    r, ra, rf = delta_row('noSRB+noFFT_s1', 'noSRB+noFFT'), delta_row('noSRB_s1', 'noSRB'), delta_row('no_fft_s1', 'no_fft')
-    if r and ra and rf:
-        t9b.append(dict(pair='noSRB+noL_fft', d_pair=r['avg_delta'], d_first=ra['avg_delta'], d_second=rf['avg_delta'],
-                        additive_prediction=ra['avg_delta'] + rf['avg_delta'],
-                        interaction=r['avg_delta'] - (ra['avg_delta'] + rf['avg_delta'])))
-    save_table(t9b, 'table9_interactions', cfg); tables['t9b'] = t9b
-    # Table 12: loss-weight sensitivity
-    t12 = []
-    for k, w in cfg.LOSS_WEIGHTS.items():
-        row = dict(term=k, default=w)
-        for f in (0.5, 2.0):
-            s = _scores(cfg, f'w_{k}_x{f:g}_s1', B)
-            if s and ref:
-                for b in B:
-                    row[f'x{f:g}_d_{b}'] = s[b] - ref[b]
-                row[f'x{f:g}_d_avg'] = float(np.mean([s[b] - ref[b] for b in B]))
-        if len(row) > 2:
-            t12.append(row)
-    save_table(t12, 'table12_loss_sensitivity', cfg); tables['t12'] = t12
-    # Table 8 B: extractors
+    if all(Y.get(k) for k in cells):
+        names = ('SIM', 'SRB', 'SCWAM')
+        for k, sg in cells.items():
+            removed = [n for n, x in zip(names, sg) if x < 0]
+            t9b.append(dict(row='cell', label=k, removed='+'.join(removed) or 'none', y=Y[k]['y'],
+                            delta_vs_R01=Y['R01']['y'] - Y[k]['y']))
+        for X in ((0,), (1,), (2,), (0, 1), (0, 2), (1, 2), (0, 1, 2)):
+            eff = 0.25 * sum(np.prod([sg[i] for i in X]) * Y[k]['y'] for k, sg in cells.items())
+            r = dict(row='effect', label=' x '.join(names[i] for i in X), effect=float(eff))
+            if stats:
+                se = stats['s'] / np.sqrt(2)
+                r.update(se=float(se), resolved=bool(abs(eff) > t975 * se))
+            t9b.append(r)
+    save_table(t9b, 'table9_interactions', cfg, digits=dict(resolved=0)); tables['t9b'] = t9b
+
+    # ---- Table 8: frozen extractor of the SIM (VGG-19 reference = R01)
     t8 = []
-    for rid, label in [('full_s1', 'VGG-19 (paper)'), ('ext_resnet50_s1', 'ResNet-50 layer1-4'), ('ext_convnextT_s1', 'ConvNeXt-T stages 1-4')]:
-        s = _scores(cfg, rid, B)
-        if s:
-            rec = read_json(os.path.join(cfg.run_dir(rid), 'run.json'), {})
-            t8.append(dict(extractor=label, **{f'psnr_{b}': s[b] for b in B}, avg=float(np.mean(list(s.values()))),
-                           trainable_M=rec.get('parameters_M', {}).get('trainable total'),
-                           frozen_M=rec.get('parameters_M', {}).get('frozen extractor')))
-    save_table(t8, 'table8_extractors', cfg); tables['t8'] = t8
+    for lab, label in (('R01', 'VGG-19 (paper)'), ('R14', 'ResNet-50 layer1-4'), ('R15', 'ConvNeXt-T stages 1-4')):
+        v = Y.get(lab)
+        if v is None:
+            continue
+        rec = read_json(os.path.join(cfg.run_dir(plan[lab]), 'run.json'), {})
+        t8.append(dict(extractor=f'{label} ({lab})', **{f'psnr_{b}': v['psnr'][b] for b in B}, **{f'ssim_{b}': v['ssim'][b] for b in B},
+                       avg=v['y'], delta_vs_R01=(v['y'] - Y['R01']['y']) if Y.get('R01') else None,
+                       trainable_M=rec.get('parameters_M', {}).get('trainable total'),
+                       frozen_M=rec.get('parameters_M', {}).get('frozen extractor')))
+    save_table(t8, 'table8_extractors', cfg, digits={**{f'ssim_{b}': 3 for b in B}, 'trainable_M': 2, 'frozen_M': 2}); tables['t8'] = t8
+
+    # ---- Table 12: Plackett-Burman screening of the loss weights
+    X = np.array(cfg.PB_DESIGN, dtype=float)
+    assert np.allclose(X.T @ X, 8 * np.eye(X.shape[1])), 'PB design is not orthogonal'
+    labs = [f'R{16 + i}' for i in range(len(X))]
+    t12 = []
+    if all(Y.get(k) for k in labs):
+        for k, row in zip(labs, X):
+            t12.append(dict(row='run', label=k, **{f: ('+' if v > 0 else '-') for f, v in zip(cfg.PB_FACTORS, row)},
+                            **{f'psnr_{b}': Y[k]['psnr'][b] for b in B}, avg=Y[k]['y']))
+        for j, f in enumerate(cfg.PB_FACTORS):
+            r = dict(row='main effect' if f != 'spare' else 'spare column (noise level)', label=f)
+            for b in B + ['avg']:
+                vals = np.array([Y[k]['y'] if b == 'avg' else Y[k]['psnr'][b] for k in labs])
+                r[f'effect_{b}'] = float(vals[X[:, j] > 0].mean() - vals[X[:, j] < 0].mean())
+                if stats:
+                    r[f'se_{b}'] = float((stats['s'] if b == 'avg' else stats['s_per_benchmark'][b]) / np.sqrt(2))
+            t12.append(r)
+        if Y.get('R01'):
+            r = dict(row='curvature', label='mean(R16-R23) - R01')
+            for b in B + ['avg']:
+                vals = [Y[k]['y'] if b == 'avg' else Y[k]['psnr'][b] for k in labs]
+                r[f'effect_{b}'] = float(np.mean(vals) - (Y['R01']['y'] if b == 'avg' else Y['R01']['psnr'][b]))
+            t12.append(r)
+    save_table(t12, 'table12_loss_sensitivity', cfg); tables['t12'] = t12
     return tables
 
 
@@ -1089,11 +1121,13 @@ def section41_report(cfg):
             continue
         rec = read_json(os.path.join(cfg.run_dir(rid), 'run.json'))
         if rec and 'budget' in rec:
-            runs.append(dict(run_id=rid, group=rec['group'], seed=rec['seed'], status=rec['status'],
+            runs.append(dict(run_id=rid, label=run.get('label'), group=rec['group'], seed=rec['seed'], status=rec['status'],
                              epochs=rec['budget']['epochs'], iterations=rec['budget']['iterations_done'],
                              total_iters=rec['budget']['total_iters'], wall_clock_h=rec.get('wall_clock_hours'),
                              gpu=rec.get('environment', {}).get('gpu'), selected=rec.get('selection', {}).get('selected'),
-                             best_val_psnr=rec.get('selection', {}).get('best_val_psnr')))
+                             best_val_psnr=rec.get('selection', {}).get('best_val_psnr'),
+                             checkpoint=os.path.join(cfg.ckpt_dir(rid), 'final.pth'),
+                             **{f'{b}_{k}': rec.get('eval', {}).get(b, {}).get(k) for b in cfg.ABLATION_BENCHMARKS for k in ('psnr', 'ssim')}))
     save_table(runs, 'section41_runs', cfg, digits=dict(seed=0, epochs=0, iterations=0, total_iters=0, wall_clock_h=2, best_val_psnr=2))
     full = read_json(os.path.join(cfg.run_dir(cfg.report_run_id()), 'run.json'), {})
     reference = read_json(os.path.join(cfg.run_dir(cfg.FULL_RUN_ID), 'run.json'), {})

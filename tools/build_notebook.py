@@ -23,12 +23,12 @@ Each code cell below is **identical** to the module of the same name in the repo
 | stage | what it does | main outputs (under `OUTPUT_ROOT`) |
 |---|---|---|
 | `audit` | restores the datasets from the Google-Drive cache (or downloads them once and caches them), builds the frozen training manifest with the train/test leakage audit, validates every category and benchmark (pairing, alignment, direction, sizes), writes the Step-0 facts (metric definition, SSIM-loss gradient, SRB gate initialisation, submitted checkpoint, data pairing) | `datasets_cache/*.tar`, `data_manifest/{train_manifest,data_validation}.json`, `analysis/step0_facts/` |
-| `train_full` | KASIRNet, `EPOCHS` = 100 (batch 64, Adam 3e-4 with 1,500-iteration warm-up, cosine, clip 1.0, FP16, calibrated six-term loss): the reported model and the "full, seed 1" of every ablation table, trained once; continues from any compatible earlier checkpoint | `checkpoints/KASIRNet_full/final.pth`, `runs/KASIRNet_full/{run.json, curves.png, history_*.csv}` |
+| `train_full` | full-budget KASIRNet of Tables 4–5, `EPOCHS` = 100 (batch 64, Adam 3e-4 with 1,500-iteration warm-up, cosine, clip 1.0, FP16, calibrated six-term loss); continues from any compatible earlier checkpoint | `checkpoints/KASIRNet_full/final.pth`, `runs/KASIRNet_full/{run.json, curves.png, history_*.csv}` |
 | `train_main` | optional longer final model (`MAIN_EPOCHS` > 0; 0 by default) | `checkpoints/KASIRNet_main/` |
 | `eval_full` | inference protocol chosen once on the held-out validation pairs (`full` / train-consistent `tiled256` / `tiled384`), then 8 benchmarks + Rain100H + Snow100K-S/M + Gaussian σ15/25/50 + LIVE1/LOL/DPDD (Köhler registered to its reference) | `analysis/inference_protocol/`, `runs/KASIRNet_main/eval/<bench>/per_image.csv` (PSNR, SSIM, LPIPS, DISTS), `summary.json` |
 | `analyses_full` | cost (TODO-13), bootstrap CI + Wilcoxon (TODO-12C), LPIPS/DISTS + divergent % (TODO-14), prompt probe + mixed sets (TODO-16), spectral/phase analysis, feature stability, Figs. S1/S2 (TODO-06), explainability | `tables/`, `analysis/` |
-| `ablations` | 45 runs with the same 100 epochs and recipe as `KASIRNet_full` (which is their seed-1 full reference, trained once): TODO-12A (5 variants × 3 seeds), TODO-09B (extractors), TODO-12B (interactions), TODO-15 (loss weights ×0.5/×2), Table 6 rows, Table 7 rows, SCWAM design | `runs/<run_id>/run.json` + GoPro/Rain100L/SIDD per-image CSVs |
-| `analyses_ablation` | SIM vs severity (TODO-09A) and all ablation tables | `tables/table6…`, `table7…`, `table8…`, `table9…`, `table12…` |
+| `ablations` | RUN PLAN of `TODO_computations.md`: 23 runs at budget B = 80 epochs, launch order R01–R03, R04–R07, R10–R13 (full ×3 seeds, w/o SIM / SRB / SCWAM / Prompt, 2³ factorial), R14–R15 (ResNet-50, ConvNeXt-T extractors), R16–R23 (Plackett–Burman loss weights), R08–R09 (Prompt seeds) | `runs/<run_id>/run.json` + GoPro/Rain100L/SIDD per-image CSVs |
+| `analyses_ablation` | SIM vs severity (TODO-09A, R01 vs R04) and the ablation tables with the fixed statistical rules of the plan | `tables/table8…`, `table9…`, `table12…`, `ablation_spread.json` |
 | `tables` | Tables 4/5, Rain100H (TODO-02), zero-shot (TODO-17), Section 4.1 reproducibility summary | `tables/*.csv`, `tables/*.tex` |
 
 **Parallel sessions.** If more than one G4 session is available, open this notebook in each of them (same Google account / Drive) and *Run all*: a run being trained holds a lock with a heartbeat, so the sessions share the ablation queue without training the same run twice (`Config.LOCK_STALE_MINUTES`). The measured s/iteration and the GPU-hours left are printed at the start of the `ablations` stage.
@@ -61,7 +61,7 @@ RUN = """# ---- run everything (re-run this cell in a new session to resume)
 cfg = Config()
 # Optional overrides, e.g. to split the work across sessions:
 # cfg.STAGES = ['audit', 'train_full', 'eval_full', 'analyses_full']
-# cfg.RUN_ABLATION_GROUPS = ['TODO12A_seeds', 'TODO09B_extractor', 'TODO12B_interactions', 'TODO15_loss_sensitivity']
+# cfg.RUN_ABLATION_GROUPS = ['R01-R07_core', 'R10-R13_factorial']   # subset of the RUN PLAN (launch order)
 exp = main(cfg)
 """
 

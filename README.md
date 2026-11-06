@@ -35,7 +35,7 @@ KASIRNet is a four-scale U-Net trained once on a pool of degradation categories 
 | schedule | every run: linear warm-up over 1,500 iterations to 3e-4 (square-root scaling of the paper's 1e-4 from batch 6 to batch 64), cosine annealing per iteration to 1e-7; gradient-norm clipping 1.0 |
 | precision | FP16 autocast + GradScaler (the FFT path of the SRB is computed in FP32) |
 | loss | `5.0 L_pix + 0.5 L_fft + 1.0 L_perc + 1.0 L_ssim + 1.0 L_id + 0.5 L_edge` on scale-calibrated terms (each term divided by its gradient norm at the degraded input on the held-out validation patches, relative to `L_pix`, once per training pool): the weights are the gradient shares 56/6/11/11/11/6 %. Without calibration `L_pix` had 1 % and `L_id` 63 % of the gradient. FFT term on the orthonormal FFT; frozen loss networks in eval mode (definitions in `Loss.py`) |
-| budget | one epoch = ⌊N_train / 64⌋ iterations (26,662 samples, 416 iterations). Every run, the reported model and every ablation, gets 100 epochs (41,600 iterations) and the same recipe, so the reported model `KASIRNet_full` is also the ablation reference “full, seed 1” and is trained once; 45 ablation runs are trained besides it. `MAIN_EPOCHS > 0` adds a separate, longer final model. A paused run is resumed whenever its training pool, model, loss and learning rate are unchanged, even if the budget changed (the cosine schedule follows the new budget), and a compatible checkpoint left by an earlier notebook version is taken over instead of training from scratch. Iterations and wall-clock time are written to `run.json` and `tables/section41_runs.csv` |
+| budget | one epoch = ⌊N_train / 64⌋ iterations (26,662 samples, 416 iterations). Full-budget model `KASIRNet_full` (Tables 4–5): 100 epochs (41,600 iterations). Reduced budget B of the RUN PLAN (`TODO_computations.md`, 5 Nov 2026): **80 epochs (33,280 iterations, 0.8 of the full schedule)**, identical for the 23 runs R01–R23, cosine to 1e-7 over B. B was fixed by the computing budget, not by the settling rule of the plan (no "w/o SIM" validation log existed to apply it); Section 4.1 must say so. A paused run resumes whenever its training pool, model, loss and learning rate are unchanged, even if the budget changed, and a compatible checkpoint of an earlier notebook version is taken over. Iterations and wall-clock time are written to `run.json` and `tables/section41_runs.csv` |
 | stopping / selection | fixed budget, no early stopping; the reported checkpoint is the one with the best mean PSNR on a validation split held out from the training pool (10 pairs per category, centre 256 × 256 crops, never a test image) |
 | seeds | full model seed 1; ablations seeds 1, 2, 3 (TODO-12A) or 1; data subsets seeded (`DATA_SUBSET_SEED` = 2026), synthetic test degradations seeded per image |
 | frozen networks | VGG-19 and ResNet-50 / ConvNeXt-T with torchvision `IMAGENET1K_V1` weights, always in eval mode; the loss networks (VGG-19 perceptual, ResNet-50 identity) exist only during training |
@@ -71,17 +71,18 @@ Outputs used by the manuscript (all under `OUTPUT_ROOT/tables`, CSV + LaTeX rows
 
 | reviewer item | table / file |
 |---|---|
-| Tables 4–5 (`KASIRNet_full`, 100 epochs) | `table4_5_main_results`; the same model is the ablation reference (first row of `table6_component_ablation`) |
+| Tables 4–5 (`KASIRNet_full`, 100 epochs) | `table4_5_main_results` |
+| RUN PLAN R01–R23 (budget B) | `runs/<run_id>/run.json` (label R01…R23, seed, budget, checkpoint, per-benchmark PSNR/SSIM), `tables/ablation_spread.json` (s, ν, pooling decision, t₀.₉₇₅) |
 | TODO-02 Rain100H | `table4_5_main_results` (row `rain100h`) |
 | TODO-06 Figs. S1/S2 | `analysis/figures/FigS1_rain100l.*`, `FigS2_snow100k_l.*` (images at the 25th/50th/75th percentile of PSNR gain) |
 | TODO-09 A / B | `table8_sim_severity`, `table8_feature_stability`, `table8_extractors` |
-| TODO-12 A / B / C | `table9_seed_variance`, `table9_interactions`, `table9_bootstrap_ci`, `table9_wilcoxon_vs_competitors` |
+| TODO-12 A / B / C | `table9_seed_variance` (R01–R09: mean ± std, Δ, prediction threshold t·s·√(1+1/3), exceeds spread, Welch test for Prompt/SFT), `table9_interactions` (2³ factorial R01, R04–R06, R10–R13: Δ of each removed set, 3 main + 3 two-way + 1 three-way effects, SE = s/√2, resolved), `table9_bootstrap_ci`, `table9_wilcoxon_vs_competitors` |
 | TODO-13 | `analysis/cost/cost.json`, `table10_latency_memory` |
 | TODO-14 | `table11_perceptual` (+ per-image CSVs) |
-| TODO-15 | `table12_loss_sensitivity` |
+| TODO-15 | `table12_loss_sensitivity` (Plackett–Burman R16–R23: PSNR of the 8 runs, main effect of each weight per benchmark with SE = s_b/√2, curvature, spare column) |
 | TODO-16 | `table13_prompt_probe`, `table13_mixed_degradations` |
 | TODO-17 | `table14_zero_shot`: per unseen degradation (LIVE1 JPEG q10, LOL, DPDD; none in the training pool), effect vs the untouched input (Δ PSNR with bootstrap CI, Wilcoxon test, % images improved / unchanged / degraded, input vs output LPIPS/DISTS), Prompt-Learner routing (`analysis/prompt_probe/zero_shot_routing.json`), the same for PromptIR (also zero-shot there), and a verdict derived from the statistics only |
-| Tables 6, 7, SCWAM vs Swin design | `table6_component_ablation`, `table7_loss_ablation`, `table_scwam_design` |
+| TODO-09 B | `table8_extractors` (R14 ResNet-50, R15 ConvNeXt-T vs R01 VGG-19); TODO-09 A uses the matched pair R01 / R04 |
 | phase / amplitude (R3-2, R5-2) | `spectral_amplitude_phase_attribution`, `spectral_srb_phase_and_gates` |
 | Section 4.1 | `section41_runs`, `section41_reproducibility.json` |
 | inference protocol | `analysis/inference_protocol/selection.json`, `validation_per_category.csv` |

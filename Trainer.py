@@ -462,7 +462,7 @@ class Trainer:
 
     def _write_record(self, status):
         rec = dict(self.record)
-        rec.update(run_id=self.run_id, group=self.run['group'], seed=self.run['seed'], status=status,
+        rec.update(run_id=self.run_id, label=self.run.get('label'), group=self.run['group'], seed=self.run['seed'], status=status,
                    recipe_signature=self.recipe, recipe_core=self.recipe_core,
                    budget=dict(epochs=self.run['epochs'], iters_per_epoch=self.ipe, total_iters=self.total_iters,
                                iterations_done=self.iteration, batch_size=self.cfg.BATCH_SIZE, patch=self.cfg.PATCH_SIZE,
