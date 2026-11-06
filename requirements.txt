@@ -1,0 +1,17 @@
+# Colab G4 runtime already provides torch / torchvision / numpy / scipy / scikit-learn / matplotlib / tqdm / pillow
+torch>=2.3
+torchvision>=0.18
+pyiqa==0.1.16        # the metric implementation that produced the reported figures (installed with --no-deps in the notebook)
+lmdb                 # SIDD validation crops
+gdown                # fallback for archives placed by hand
+kagglehub            # Kaggle sources
+deepinv==0.5.0       # Restormer / PromptIR / MPRNet architectures of the competitor stage (Competitors.py)
+opencv-python-headless  # ECC registration of the Koehler benchmark
+pyarrow              # Hugging Face parquet sources (DPDD test)
+einops               # Histoformer (vendored in Competitors.py)
+scipy
+scikit-learn
+matplotlib
+tqdm
+pillow
+numpy
